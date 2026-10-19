@@ -197,7 +197,12 @@ pub fn ensure_model(config: &AppConfig) -> Result<ModelArtifact> {
 pub fn cached_model(config: &AppConfig) -> Result<ModelArtifact> {
     let directory = config.model_dir.join(config.model.key());
     let mut files = fs::read_dir(&directory)
-        .with_context(|| format!("reading cached model directory {}", directory.display()))?
+        .with_context(|| {
+            format!(
+                "offline startup needs cached model at {}; run `winstrint download` first",
+                directory.display()
+            )
+        })?
         .filter_map(|entry| entry.ok().map(|entry| entry.path()))
         .filter(|path| {
             path.extension()
