@@ -295,10 +295,10 @@ fn wait_for_health(endpoint: &str, pid: u32, log_path: &Path) -> Result<()> {
                 log_path.display()
             );
         }
-        if let Ok(response) = client.get(format!("{endpoint}/health")).send() {
-            if response.status().is_success() {
-                return Ok(());
-            }
+        if let Ok(response) = client.get(format!("{endpoint}/health")).send()
+            && response.status().is_success()
+        {
+            return Ok(());
         }
         thread::sleep(Duration::from_millis(500));
     }
@@ -340,7 +340,7 @@ fn extract_zip(archive: &Path, destination: &Path) -> Result<()> {
     let mut zip = ZipArchive::new(file).context("reading llama.cpp zip")?;
     for index in 0..zip.len() {
         let mut entry = zip.by_index(index)?;
-        let Some(relative) = entry.enclosed_name().map(PathBuf::from) else {
+        let Some(relative) = entry.enclosed_name() else {
             anyhow::bail!("zip contains an unsafe path at index {index}");
         };
         if relative.components().any(|component| {
