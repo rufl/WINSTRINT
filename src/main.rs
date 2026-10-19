@@ -84,21 +84,20 @@ fn start_chat(config: &config::AppConfig) -> Result<()> {
     let backend = runtime::select_backend(config, &diagnostics)?;
     println!("Selected backend: {}", backend.label());
     model::print_catalog();
-    if config.no_download {
-        anyhow::bail!(
-            "--no-download was supplied; download the selected model first with `winstrint download`"
-        );
-    }
-    if !config.yes && !model_exists(config) {
-        print!("Download the selected model now? It is tens of gigabytes. [y/N] ");
-        io::stdout().flush()?;
-        let mut answer = String::new();
-        io::stdin().read_line(&mut answer)?;
-        if !answer.trim().eq_ignore_ascii_case("y") {
-            anyhow::bail!("model download cancelled; rerun with --yes to confirm");
+    let artifact = if config.no_download {
+        model::cached_model(config)?
+    } else {
+        if !config.yes && !model_exists(config) {
+            print!("Download the selected model now? It is tens of gigabytes. [y/N] ");
+            io::stdout().flush()?;
+            let mut answer = String::new();
+            io::stdin().read_line(&mut answer)?;
+            if !answer.trim().eq_ignore_ascii_case("y") {
+                anyhow::bail!("model download cancelled; rerun with --yes to confirm");
+            }
         }
-    }
-    let artifact = model::ensure_model(config)?;
+        model::ensure_model(config)?
+    };
     let fresh = diagnostics::collect()?;
     diagnostics::require_idle(&fresh, config.force, false)?;
     let process = runtime::start(config, &fresh, backend, &artifact)?;

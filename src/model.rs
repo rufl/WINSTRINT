@@ -194,6 +194,38 @@ pub fn ensure_model(config: &AppConfig) -> Result<ModelArtifact> {
     })
 }
 
+pub fn cached_model(config: &AppConfig) -> Result<ModelArtifact> {
+    let directory = config.model_dir.join(config.model.key());
+    let mut files = fs::read_dir(&directory)
+        .with_context(|| format!("reading cached model directory {}", directory.display()))?
+        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+        .filter(|path| {
+            path.extension()
+                .is_some_and(|extension| extension.eq_ignore_ascii_case("gguf"))
+                && fs::metadata(path).is_ok_and(|metadata| metadata.len() > 0)
+        })
+        .collect::<Vec<_>>();
+    files.sort();
+    if files.len() < 2 {
+        anyhow::bail!(
+            "offline startup requires at least two non-empty GGUF shards in {}; run `winstrint download` first",
+            directory.display()
+        );
+    }
+    let first_shard = files
+        .iter()
+        .find(|path| {
+            path.file_name()
+                .is_some_and(|name| name.to_string_lossy().contains("00001"))
+        })
+        .cloned()
+        .context("cached model has no first GGUF shard")?;
+    Ok(ModelArtifact {
+        directory,
+        first_shard,
+    })
+}
+
 pub fn download_verified(
     client: &Client,
     url: &str,
