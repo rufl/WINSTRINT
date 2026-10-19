@@ -1,0 +1,25 @@
+[package]
+name = "winstrint"
+version = "0.1.0"
+edition = "2024"
+description = "Safe Windows launcher for Qwen Flash Next on Intel Arc"
+license = "Apache-2.0"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4.5", features = ["derive"] }
+crossterm = "0.28"
+dirs = "6"
+hex = "0.4"
+ratatui = "0.29"
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+zip = { version = "2.2", default-features = false, features = ["deflate"] }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true
+panic = "abort"
