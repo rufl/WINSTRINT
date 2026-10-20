@@ -476,7 +476,7 @@ fn write_sycl_runtime_script(
 ) -> Result<PathBuf> {
     let script = log_path.with_file_name("llama-sycl-runtime.cmd");
     let mut content = format!(
-        "@echo off\r\nsetlocal\r\ncall {} intel64 vs2022\r\nif errorlevel 1 exit /b %errorlevel%\r\nset \"ONEAPI_DEVICE_SELECTOR=level_zero:0\"\r\nset \"SYCL_CACHE_PERSISTENT=0\"\r\n{}",
+        "@echo off\r\nsetlocal\r\ncall {} intel64 vs2022\r\nif errorlevel 1 exit /b %errorlevel%\r\nset \"ONEAPI_DEVICE_SELECTOR=level_zero:0\"\r\nset \"SYCL_CACHE_PERSISTENT=0\"\r\nset \"UR_L0_ENABLE_RELAXED_ALLOCATION_LIMITS=1\"\r\n{}",
         cmd_quote(setvars.as_os_str()),
         cmd_quote(executable.as_os_str())
     );
