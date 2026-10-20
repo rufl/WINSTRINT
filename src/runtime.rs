@@ -7,13 +7,120 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use reqwest::blocking::Client;
-use serde::Serialize;
 use serde_json::json;
 use zip::ZipArchive;
 
 use crate::config::{AppConfig, BackendPreference};
 use crate::diagnostics::{self, Diagnostics, GpuKind};
 use crate::model::{self, ModelArtifact};
+use crate::strata;
+
+#[cfg(windows)]
+use std::os::windows::io::AsRawHandle;
+
+#[cfg(windows)]
+use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
+#[cfg(windows)]
+use windows_sys::Win32::System::JobObjects::{
+    AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+    JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
+    SetInformationJobObject,
+};
+
+#[cfg(windows)]
+struct ProcessTree {
+    job: HANDLE,
+}
+
+#[cfg(not(windows))]
+struct ProcessTree;
+
+impl ProcessTree {
+    fn new() -> Result<Self> {
+        #[cfg(windows)]
+        {
+            let job = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
+            if job.is_null() {
+                anyhow::bail!(
+                    "creating runtime process job object: {}",
+                    io::Error::last_os_error()
+                );
+            }
+
+            let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+            limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+            let configured = unsafe {
+                SetInformationJobObject(
+                    job,
+                    JobObjectExtendedLimitInformation,
+                    (&limits as *const JOBOBJECT_EXTENDED_LIMIT_INFORMATION).cast(),
+                    std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+                )
+            };
+            if configured == 0 {
+                unsafe {
+                    CloseHandle(job);
+                }
+                anyhow::bail!(
+                    "configuring runtime process job object: {}",
+                    io::Error::last_os_error()
+                );
+            }
+            Ok(Self { job })
+        }
+        #[cfg(not(windows))]
+        {
+            Ok(Self)
+        }
+    }
+
+    fn assign(&self, child: &Child) -> Result<()> {
+        #[cfg(windows)]
+        {
+            let process = child.as_raw_handle();
+            if process.is_null() {
+                anyhow::bail!("runtime child returned a null process handle");
+            }
+            if unsafe { AssignProcessToJobObject(self.job, process) } == 0 {
+                anyhow::bail!(
+                    "assigning runtime child to its process job: {}",
+                    io::Error::last_os_error()
+                );
+            }
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = child;
+        }
+        Ok(())
+    }
+}
+
+#[cfg(windows)]
+impl Drop for ProcessTree {
+    fn drop(&mut self) {
+        unsafe {
+            CloseHandle(self.job);
+        }
+    }
+}
+
+fn terminate_child(mut child: Child) {
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+fn spawn_runtime(mut command: Command, description: &str) -> Result<(Child, ProcessTree)> {
+    let process_tree = ProcessTree::new()?;
+    let child = command
+        .spawn()
+        .with_context(|| format!("starting {description}"))?;
+    if let Err(error) = process_tree.assign(&child) {
+        terminate_child(child);
+        return Err(error);
+    }
+    Ok((child, process_tree))
+}
 
 const LLAMA_TAG: &str = "b11669";
 const LLAMA_SYCL_URL: &str = "https://github.com/ggml-org/llama.cpp/releases/download/b11669/llama-b11669-bin-win-sycl-x64.zip";
@@ -26,6 +133,7 @@ const LLAMA_VULKAN_SHA256: &str =
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ResolvedBackend {
+    Cpu,
     LlamaSycl,
     LlamaVulkan,
     Strata,
@@ -33,6 +141,7 @@ pub enum ResolvedBackend {
 impl ResolvedBackend {
     pub fn label(self) -> &'static str {
         match self {
+            Self::Cpu => "llama.cpp CPU",
             Self::LlamaSycl => "llama.cpp SYCL",
             Self::LlamaVulkan => "llama.cpp Vulkan",
             Self::Strata => "Strata native SYCL",
@@ -42,20 +151,36 @@ impl ResolvedBackend {
 
 pub struct RuntimeProcess {
     child: Child,
+    _process_tree: ProcessTree,
     pub endpoint: String,
 }
 
-#[derive(Serialize)]
-struct StrataConfig {
-    backend: &'static str,
-    args: Vec<String>,
-    cwd: String,
-    env: serde_json::Value,
+#[derive(Clone, Copy)]
+enum LlamaLaunch {
+    Gpu(ResolvedBackend),
+    Cpu,
+}
+
+impl LlamaLaunch {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Gpu(backend) => backend.label(),
+            Self::Cpu => "llama.cpp CPU fallback",
+        }
+    }
+
+    fn health_timeout(self) -> Duration {
+        match self {
+            Self::Gpu(_) => Duration::from_secs(300),
+            Self::Cpu => Duration::from_secs(1_800),
+        }
+    }
 }
 
 pub fn select_backend(config: &AppConfig, diagnostics: &Diagnostics) -> Result<ResolvedBackend> {
     let target = diagnostics::target_gpu(diagnostics);
     match config.backend {
+        BackendPreference::Cpu => Ok(ResolvedBackend::Cpu),
         BackendPreference::Sycl => {
             if !diagnostics.has_sycl {
                 anyhow::bail!(
@@ -73,17 +198,38 @@ pub fn select_backend(config: &AppConfig, diagnostics: &Diagnostics) -> Result<R
             Ok(ResolvedBackend::LlamaVulkan)
         }
         BackendPreference::Strata => strata_backend(config, target),
-        BackendPreference::Auto => match target.map(|gpu| gpu.kind) {
-            Some(GpuKind::A770) if diagnostics.has_sycl => Ok(ResolvedBackend::LlamaSycl),
-            Some(GpuKind::A770) if diagnostics.has_vulkan => Ok(ResolvedBackend::LlamaVulkan),
-            Some(GpuKind::Arc140T) if diagnostics.has_vulkan => Ok(ResolvedBackend::LlamaVulkan),
-            Some(GpuKind::Arc140T) if diagnostics.has_sycl => Ok(ResolvedBackend::LlamaSycl),
-            Some(GpuKind::OtherIntel) if diagnostics.has_vulkan => Ok(ResolvedBackend::LlamaVulkan),
-            Some(GpuKind::OtherIntel) if diagnostics.has_sycl => Ok(ResolvedBackend::LlamaSycl),
-            _ if diagnostics.has_vulkan => Ok(ResolvedBackend::LlamaVulkan),
-            _ if diagnostics.has_sycl => Ok(ResolvedBackend::LlamaSycl),
-            _ => anyhow::bail!("no usable SYCL or Vulkan backend was detected"),
-        },
+        BackendPreference::Auto => {
+            let candidate = match target.map(|gpu| gpu.kind) {
+                Some(GpuKind::A770) if diagnostics.has_sycl => ResolvedBackend::LlamaSycl,
+                Some(GpuKind::A770) if diagnostics.has_vulkan => ResolvedBackend::LlamaVulkan,
+                Some(GpuKind::Arc140T) if diagnostics.has_vulkan => ResolvedBackend::LlamaVulkan,
+                Some(GpuKind::Arc140T) if diagnostics.has_sycl => ResolvedBackend::LlamaSycl,
+                Some(GpuKind::OtherIntel) if diagnostics.has_vulkan => ResolvedBackend::LlamaVulkan,
+                Some(GpuKind::OtherIntel) if diagnostics.has_sycl => ResolvedBackend::LlamaSycl,
+                _ if diagnostics.has_vulkan => ResolvedBackend::LlamaVulkan,
+                _ if diagnostics.has_sycl => ResolvedBackend::LlamaSycl,
+                _ => anyhow::bail!("no usable SYCL or Vulkan backend was detected"),
+            };
+            // This guard is only for llama.cpp, which cannot stream this model's experts.
+            if matches!(
+                candidate,
+                ResolvedBackend::LlamaSycl | ResolvedBackend::LlamaVulkan
+            ) {
+                let model = model::spec(config.model);
+                if let Some(gpu) = target
+                    && gpu.adapter_ram_bytes > 0
+                    && model.resident_bytes > gpu.adapter_ram_bytes
+                {
+                    println!(
+                        "Auto backend: {:.1} GiB model shard exceeds {:.1} GiB GPU memory; using CPU.",
+                        model.resident_bytes as f64 / 1e9,
+                        gpu.adapter_ram_bytes as f64 / 1e9
+                    );
+                    return Ok(ResolvedBackend::Cpu);
+                }
+            }
+            Ok(candidate)
+        }
     }
 }
 
@@ -94,7 +240,7 @@ pub fn start(
     artifact: &ModelArtifact,
 ) -> Result<RuntimeProcess> {
     match backend {
-        ResolvedBackend::LlamaSycl | ResolvedBackend::LlamaVulkan => {
+        ResolvedBackend::Cpu | ResolvedBackend::LlamaSycl | ResolvedBackend::LlamaVulkan => {
             start_llama(config, diagnostics, backend, artifact)
         }
         ResolvedBackend::Strata => start_strata(config, diagnostics, artifact),
@@ -103,13 +249,13 @@ pub fn start(
 
 pub fn ensure_llama_bundle(config: &AppConfig, backend: ResolvedBackend) -> Result<PathBuf> {
     let (suffix, url, size, sha) = match backend {
-        ResolvedBackend::LlamaSycl => ("sycl", LLAMA_SYCL_URL, LLAMA_SYCL_SIZE, LLAMA_SYCL_SHA256),
-        ResolvedBackend::LlamaVulkan => (
+        ResolvedBackend::Cpu | ResolvedBackend::LlamaVulkan => (
             "vulkan",
             LLAMA_VULKAN_URL,
             LLAMA_VULKAN_SIZE,
             LLAMA_VULKAN_SHA256,
         ),
+        ResolvedBackend::LlamaSycl => ("sycl", LLAMA_SYCL_URL, LLAMA_SYCL_SIZE, LLAMA_SYCL_SHA256),
         ResolvedBackend::Strata => anyhow::bail!("Strata does not use a llama.cpp runtime bundle"),
     };
     let directory = config
@@ -158,11 +304,64 @@ fn start_llama(
     let log_dir = config.data_dir.join("logs");
     fs::create_dir_all(&log_dir)?;
     let log_path = log_dir.join("llama-server.log");
+    let launch = match backend {
+        ResolvedBackend::Cpu => LlamaLaunch::Cpu,
+        ResolvedBackend::LlamaSycl | ResolvedBackend::LlamaVulkan => LlamaLaunch::Gpu(backend),
+        ResolvedBackend::Strata => unreachable!(),
+    };
+
+    match launch {
+        LlamaLaunch::Cpu => start_llama_process(
+            config,
+            diagnostics,
+            artifact,
+            &executable,
+            &log_path,
+            launch,
+        ),
+        LlamaLaunch::Gpu(gpu_backend) => match start_llama_process(
+            config,
+            diagnostics,
+            artifact,
+            &executable,
+            &log_path,
+            launch,
+        ) {
+            Ok(process) => Ok(process),
+            Err(error) => {
+                eprintln!("{} could not load the model: {error}", gpu_backend.label());
+                eprintln!(
+                    "Falling back to CPU execution; startup can take several minutes for this model."
+                );
+                start_llama_process(
+                    config,
+                    diagnostics,
+                    artifact,
+                    &executable,
+                    &log_path,
+                    LlamaLaunch::Cpu,
+                )
+                .with_context(|| {
+                    format!("starting CPU fallback after {} failed", gpu_backend.label())
+                })
+            }
+        },
+    }
+}
+
+fn start_llama_process(
+    config: &AppConfig,
+    diagnostics: &Diagnostics,
+    artifact: &ModelArtifact,
+    executable: &Path,
+    log_path: &Path,
+    launch: LlamaLaunch,
+) -> Result<RuntimeProcess> {
     let log = OpenOptions::new()
         .create(true)
         .append(true)
-        .open(&log_path)?;
-    let mut command = Command::new(&executable);
+        .open(log_path)?;
+    let mut command = Command::new(executable);
     command
         .current_dir(executable.parent().unwrap_or_else(|| Path::new(".")))
         .arg("--model")
@@ -173,36 +372,61 @@ fn start_llama(
         .arg(config.port.to_string())
         .arg("--ctx-size")
         .arg(config.context.to_string())
-        .arg("--n-gpu-layers")
-        .arg("999")
         .arg("--parallel")
         .arg("1")
-        .arg("--moe-cache-mib")
-        .arg(recommended_cache_mib(diagnostics).to_string())
         .stdout(Stdio::from(log.try_clone()?))
         .stderr(Stdio::from(log));
-    match backend {
-        ResolvedBackend::LlamaSycl => {
+    match launch {
+        LlamaLaunch::Gpu(backend) => {
             command
+                .arg("--n-gpu-layers")
+                .arg("auto")
+                .arg("--fit")
+                .arg("on")
+                .arg("--moe-cache-mib")
+                .arg(recommended_cache_mib(diagnostics).to_string());
+            match backend {
+                ResolvedBackend::LlamaSycl => {
+                    command
+                        .arg("--device")
+                        .arg("SYCL0")
+                        .env("ONEAPI_DEVICE_SELECTOR", "level_zero:0")
+                        .env("SYCL_CACHE_PERSISTENT", "0");
+                }
+                ResolvedBackend::LlamaVulkan => {
+                    command.arg("--device").arg("Vulkan0");
+                }
+                ResolvedBackend::Cpu | ResolvedBackend::Strata => unreachable!(),
+            }
+        }
+        LlamaLaunch::Cpu => {
+            command
+                .arg("--n-gpu-layers")
+                .arg("0")
                 .arg("--device")
-                .arg("SYCL0")
-                .env("ONEAPI_DEVICE_SELECTOR", "level_zero:0")
-                .env("SYCL_CACHE_PERSISTENT", "0");
+                .arg("none")
+                .arg("--no-kv-offload")
+                .arg("--no-op-offload")
+                .arg("--moe-cache-mib")
+                .arg("0");
         }
-        ResolvedBackend::LlamaVulkan => {
-            command.arg("--device").arg("Vulkan0");
-        }
-        ResolvedBackend::Strata => unreachable!(),
     }
-    println!("Starting {}", backend.label());
+    println!("Starting {}", launch.label());
     println!("Model: {}", artifact.first_shard.display());
     println!("Runtime log: {}", log_path.display());
-    let child = command
-        .spawn()
-        .with_context(|| format!("starting {}", executable.display()))?;
+    let executable_label = executable.display().to_string();
+    let (mut child, process_tree) = spawn_runtime(command, &executable_label)?;
     let endpoint = format!("http://127.0.0.1:{}", config.port);
-    wait_for_health(&endpoint, child.id(), &log_path)?;
-    Ok(RuntimeProcess { child, endpoint })
+    if let Err(error) = wait_for_health(&endpoint, &mut child, launch.health_timeout(), log_path) {
+        terminate_child(child);
+        drop(process_tree);
+        return Err(error);
+    }
+    Ok(RuntimeProcess {
+        child,
+        _process_tree: process_tree,
+        endpoint,
+    })
 }
 
 fn start_strata(
@@ -210,69 +434,41 @@ fn start_strata(
     diagnostics: &Diagnostics,
     artifact: &ModelArtifact,
 ) -> Result<RuntimeProcess> {
-    if diagnostics
-        .gpus
-        .iter()
-        .any(|gpu| matches!(gpu.kind, GpuKind::A770 | GpuKind::Arc140T))
-    {
-        anyhow::bail!(
-            "Strata's current Windows SYCL branch is tested for Arc Pro B70, not A770/Arc 140T; use llama.cpp SYCL/Vulkan"
-        );
+    let launch = strata::prepare_launch(config, diagnostics::target_gpu(diagnostics), artifact)?;
+    let log_path = &launch.log_path;
+    if let Some(parent) = log_path.parent() {
+        fs::create_dir_all(parent)?;
     }
-    let root = config.data_dir.join("strata");
-    let script = root.join("sycl").join("serve").join("server_intel.py");
-    let engine = root.join("engine").join("strata.exe");
-    if !script.exists() || !engine.exists() {
-        anyhow::bail!(
-            "Strata is not provisioned; expected {} and {}",
-            script.display(),
-            engine.display()
-        );
-    }
-    let python = std::env::var_os("WINSTRINT_PYTHON")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("python"));
-    if !diagnostics::command_exists("python") && std::env::var_os("WINSTRINT_PYTHON").is_none() {
-        anyhow::bail!("Python is required for the Strata server wrapper; set WINSTRINT_PYTHON");
-    }
-    let config_path = root.join("winstrint-strata.json");
-    let strata_config = StrataConfig {
-        backend: "sycl",
-        args: vec![
-            "--native".into(),
-            artifact.first_shard.to_string_lossy().into_owned(),
-            "--max-context".into(),
-            config.context.to_string(),
-            "--stream-experts".into(),
-        ],
-        cwd: root.to_string_lossy().into_owned(),
-        env: json!({"SYCL_UR_USE_LEVEL_ZERO_V2":"1","SYCL_CACHE_PERSISTENT":"0","UR_L0_ENABLE_RELAXED_ALLOCATION_LIMITS":"1","ZES_ENABLE_SYSMAN":"1","STRATA_VERIFY_DEVICE_PLAN":"1","STRATA_VERIFY_NO_HOST":"1","STRATA_SYCL_HEARTBEAT_S":"10"}),
-    };
-    fs::write(&config_path, serde_json::to_vec_pretty(&strata_config)?)?;
-    let log_path = config.data_dir.join("logs").join("strata-server.log");
-    fs::create_dir_all(log_path.parent().expect("log path has parent"))?;
     let log = OpenOptions::new()
         .create(true)
         .append(true)
-        .open(&log_path)?;
-    let child = Command::new(python)
-        .current_dir(&root)
-        .arg(&script)
-        .arg("--engine")
-        .arg("strata")
-        .arg("--config")
-        .arg(&config_path)
-        .arg("--host")
-        .arg("127.0.0.1")
-        .arg("--port")
-        .arg(config.port.to_string())
-        .stdout(Stdio::from(log.try_clone()?))
-        .stderr(Stdio::from(log))
-        .spawn()
-        .context("starting Strata server wrapper")?;
+        .open(log_path)
+        .with_context(|| format!("opening Strata runtime log {}", log_path.display()))?;
+    let log_copy = log
+        .try_clone()
+        .with_context(|| format!("duplicating Strata runtime log {}", log_path.display()))?;
+    let mut command = Command::new(&launch.program);
+    command
+        .args(&launch.args)
+        .current_dir(&launch.cwd)
+        .stdout(Stdio::from(log_copy))
+        .stderr(Stdio::from(log));
+    println!("Starting Strata native SYCL");
+    println!("Model: {}", artifact.first_shard.display());
+    println!("Runtime log: {}", log_path.display());
+    let executable_label = launch.program.display().to_string();
+    let (mut child, process_tree) = spawn_runtime(command, &executable_label)?;
     let endpoint = format!("http://127.0.0.1:{}", config.port);
-    wait_for_health(&endpoint, child.id(), &log_path)?;
-    Ok(RuntimeProcess { child, endpoint })
+    if let Err(error) = wait_for_health(&endpoint, &mut child, launch.health_timeout, log_path) {
+        terminate_child(child);
+        drop(process_tree);
+        return Err(error);
+    }
+    Ok(RuntimeProcess {
+        child,
+        _process_tree: process_tree,
+        endpoint,
+    })
 }
 
 impl Drop for RuntimeProcess {
@@ -284,14 +480,27 @@ impl Drop for RuntimeProcess {
     }
 }
 
-fn wait_for_health(endpoint: &str, pid: u32, log_path: &Path) -> Result<()> {
+fn wait_for_health(
+    endpoint: &str,
+    child: &mut Child,
+    timeout: Duration,
+    log_path: &Path,
+) -> Result<()> {
     let client = Client::builder().timeout(Duration::from_secs(2)).build()?;
-    let deadline = Instant::now() + Duration::from_secs(180);
+    let deadline = Instant::now() + timeout;
     loop {
+        if let Some(status) = child.try_wait().context("checking runtime process")? {
+            anyhow::bail!(
+                "runtime pid {} exited with status {status}; inspect {}",
+                child.id(),
+                log_path.display()
+            );
+        }
         if Instant::now() > deadline {
             anyhow::bail!(
-                "runtime pid {} did not become healthy within 180 seconds; inspect {}",
-                pid,
+                "runtime pid {} did not become healthy within {} seconds; inspect {}",
+                child.id(),
+                timeout.as_secs(),
                 log_path.display()
             );
         }
@@ -308,22 +517,7 @@ fn strata_backend(
     config: &AppConfig,
     target: Option<&crate::diagnostics::GpuInfo>,
 ) -> Result<ResolvedBackend> {
-    if target.is_some_and(|gpu| matches!(gpu.kind, GpuKind::A770 | GpuKind::Arc140T)) {
-        anyhow::bail!(
-            "Strata Windows support is not validated for A770/Arc 140T; use --backend sycl or --backend vulkan"
-        );
-    }
-    let engine = config
-        .data_dir
-        .join("strata")
-        .join("engine")
-        .join("strata.exe");
-    if !engine.exists() {
-        anyhow::bail!(
-            "Strata engine is not provisioned at {}; use llama.cpp or provision Strata explicitly",
-            engine.display()
-        );
-    }
+    strata::validate_for_runtime(config, target)?;
     Ok(ResolvedBackend::Strata)
 }
 

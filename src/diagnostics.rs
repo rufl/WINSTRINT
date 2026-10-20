@@ -102,6 +102,17 @@ pub fn print_report(diagnostics: &Diagnostics) {
         diagnostics.has_sycl,
         diagnostics.sycl_ls_available
     );
+    if cfg!(windows) {
+        println!(
+            "Strata: managed native Windows SYCL port requires Intel oneAPI DPC++/C++, Visual Studio Build Tools, and Level Zero; run `winstrint strata-status --verify`."
+        );
+    } else if diagnostics.has_sycl {
+        println!("Strata: native Intel Arc SYCL prerequisites detected.");
+    } else if diagnostics.has_vulkan {
+        println!("Strata: Intel Arc SYCL prerequisites are unavailable; Vulkan is available.");
+    } else {
+        println!("Strata: Intel Arc SYCL and Vulkan prerequisites are unavailable.");
+    }
     match diagnostics.activity.utilization_percent {
         Some(value) => println!("GPU activity: {:.1}%", value),
         None => println!("GPU activity: unavailable (no reliable counter)"),

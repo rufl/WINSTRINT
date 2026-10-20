@@ -7,6 +7,7 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
 pub enum BackendPreference {
     Auto,
+    Cpu,
     Sycl,
     Vulkan,
     Strata,
@@ -19,6 +20,14 @@ pub enum ModelChoice {
     Iq2Xs,
     Iq3Xxs,
     Iq3S,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+pub enum StrataTarget {
+    Auto,
+    A770,
+    #[value(name = "arc140t", alias = "arc-140t")]
+    Arc140T,
 }
 
 impl ModelChoice {
@@ -45,7 +54,7 @@ pub struct CommonArgs {
     pub queue_path: Option<PathBuf>,
     #[arg(long, default_value_t = 8080)]
     pub port: u16,
-    #[arg(long, default_value_t = 32768)]
+    #[arg(long, default_value_t = 4096)]
     pub context: u32,
     #[arg(long)]
     pub force: bool,
@@ -79,6 +88,27 @@ pub enum Command {
         purpose: String,
         #[arg(last = true, required = true)]
         command: Vec<String>,
+    },
+    #[command(about = "Inspect the managed Windows Strata SYCL environment")]
+    StrataEnv,
+    #[command(about = "Clone, patch, build, and provision the managed Windows Strata SYCL engine")]
+    StrataProvision {
+        #[arg(long, value_enum, default_value = "auto")]
+        target: StrataTarget,
+        #[arg(long)]
+        rebuild: bool,
+        #[arg(long)]
+        skip_probe: bool,
+    },
+    #[command(about = "Probe the managed Windows Strata SYCL engine")]
+    StrataProbe,
+    #[command(about = "Show Strata source, Windows patch, and toolchain provenance")]
+    StrataStatus {
+        #[arg(
+            long,
+            help = "Run the oneAPI/CMake/Ninja preflight in addition to printing paths"
+        )]
+        verify: bool,
     },
     #[command(about = "Start the selected model and open the terminal chat")]
     Chat,

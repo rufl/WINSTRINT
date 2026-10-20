@@ -42,9 +42,13 @@ impl ChatClient {
         let response = self
             .client
             .post(format!("{}/v1/chat/completions", self.endpoint))
-            .json(
-                &json!({"model": model, "messages": messages, "stream": false, "max_tokens": 4096}),
-            )
+            .json(&json!({
+                "model": model,
+                "messages": messages,
+                "stream": false,
+                "max_tokens": 4096,
+                "reasoning_effort": "low",
+            }))
             .send()
             .context("sending chat request")?;
         let status = response.status();

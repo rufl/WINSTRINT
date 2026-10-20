@@ -3,6 +3,7 @@ mod diagnostics;
 mod model;
 mod queue;
 mod runtime;
+mod strata;
 mod tui;
 
 use std::io::{self, Write};
@@ -73,6 +74,35 @@ fn run() -> Result<()> {
             let status = queue.run_ticketed(&purpose, &command, config.force)?;
             std::process::exit(status.code().unwrap_or(1));
         }
+        Some(Command::StrataEnv) => {
+            config.ensure_dirs()?;
+            let python = strata::ensure_python_environment(&config)?;
+            println!("Strata Python environment ready: {}", python.display());
+            Ok(())
+        }
+        Some(Command::StrataProvision {
+            target,
+            rebuild,
+            skip_probe,
+        }) => {
+            config.ensure_dirs()?;
+            strata::provision(&config, target, rebuild)?;
+            if !skip_probe {
+                let queue = queue::GpuQueue::new(&config.queue_path);
+                let _lease = queue.acquire("strata-provision-probe", true)?;
+                strata::probe(&config, config.force)?;
+            } else {
+                println!("Strata probe skipped; run `winstrint strata-probe` before starting it.");
+            }
+            Ok(())
+        }
+        Some(Command::StrataProbe) => {
+            config.ensure_dirs()?;
+            let queue = queue::GpuQueue::new(&config.queue_path);
+            let _lease = queue.acquire("strata-probe", true)?;
+            strata::probe(&config, config.force).map(|_| ())
+        }
+        Some(Command::StrataStatus { verify }) => strata::print_status(&config, verify),
         Some(Command::Chat) | None => start_chat(&config),
     }
 }
@@ -95,6 +125,14 @@ fn start_chat(config: &config::AppConfig) -> Result<()> {
             if !answer.trim().eq_ignore_ascii_case("y") {
                 anyhow::bail!("model download cancelled; rerun with --yes to confirm");
             }
+        }
+        if !matches!(backend, runtime::ResolvedBackend::Strata) {
+            println!(
+                "Preparing {} before downloading the model...",
+                backend.label()
+            );
+            runtime::ensure_llama_bundle(config, backend)
+                .with_context(|| format!("preparing the {} runtime bundle", backend.label()))?;
         }
         model::ensure_model(config)?
     };
