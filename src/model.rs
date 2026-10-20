@@ -86,6 +86,7 @@ pub const MODEL_SPECS: [ModelSpec; 5] = [
 pub struct ModelArtifact {
     pub directory: PathBuf,
     pub first_shard: PathBuf,
+    pub shards: Vec<PathBuf>,
 }
 
 #[derive(Deserialize)]
@@ -245,6 +246,7 @@ pub fn ensure_model(config: &AppConfig) -> Result<ModelArtifact> {
     Ok(ModelArtifact {
         directory,
         first_shard,
+        shards: files,
     })
 }
 
@@ -342,6 +344,7 @@ pub fn cached_model(config: &AppConfig) -> Result<ModelArtifact> {
     Ok(ModelArtifact {
         directory,
         first_shard,
+        shards: files,
     })
 }
 

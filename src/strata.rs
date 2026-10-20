@@ -260,10 +260,11 @@ pub fn print_status(config: &AppConfig, verify: bool) -> Result<()> {
         None => println!("oneAPI setvars: missing"),
     }
     if verify {
-        match preflight_native_toolchain() {
-            Ok(()) => println!("Native toolchain: ready"),
-            Err(error) => println!("Native toolchain: unavailable ({error:#})"),
+        if let Err(error) = preflight_native_toolchain() {
+            println!("Native toolchain: unavailable ({error:#})");
+            return Err(error).context("native toolchain verification failed");
         }
+        println!("Native toolchain: ready");
     }
     Ok(())
 }
@@ -898,31 +899,29 @@ fn prepare_model(
             artifact.first_shard.display()
         )
     })?;
-    let mut shards = gguf_shards(&artifact.directory)?;
-    for shard in &mut shards {
-        *shard = fs::canonicalize(&*shard)
-            .with_context(|| format!("canonicalizing model shard {}", shard.display()))?;
-    }
-    if shards.len() < 2 {
-        bail!(
-            "Strata streaming launch needs at least two GGUF shards in {}",
-            artifact.directory.display()
-        );
-    }
+    let shards = canonical_model_shards(artifact)?;
     let ple_shard = select_ple_shard(python, source, &shards)?;
     let pack_root = strata_root(config).join("packs").join(config.model.key());
     fs::create_dir_all(&pack_root)?;
     let pack = pack_root.join("native");
+    let tokenizer = pack_root.join("tokenizer");
     let marker = pack_root.join(".winstrint-prepared");
     let expected_marker = format!(
         "model_revision={}\nstrata_commit={STRATA_COMMIT}\nwindows_patch={WINDOWS_PATCH_VERSION}\n",
         model_manifest_revision(artifact)?
     );
-    if fs::read_to_string(&marker).ok().as_deref() != Some(expected_marker.as_str())
-        && pack.exists()
-    {
-        fs::remove_dir_all(&pack)
-            .with_context(|| format!("removing stale Strata pack {}", pack.display()))?;
+    let marker_matches =
+        fs::read_to_string(&marker).ok().as_deref() == Some(expected_marker.as_str());
+    if !marker_matches {
+        if pack.exists() {
+            fs::remove_dir_all(&pack)
+                .with_context(|| format!("removing stale Strata pack {}", pack.display()))?;
+        }
+        if tokenizer.exists() {
+            fs::remove_dir_all(&tokenizer).with_context(|| {
+                format!("removing stale Strata tokenizer {}", tokenizer.display())
+            })?;
+        }
     }
     if !pack.join("native_experts.txt").is_file() {
         run_python(
@@ -939,7 +938,6 @@ fn prepare_model(
             "creating the Strata native IQ pack",
         )?;
     }
-    let tokenizer = pack.join("tokenizer");
     if !tokenizer.join("vocab.json").is_file() || !tokenizer.join("chat_template.jinja").is_file() {
         run_python(
             python,
@@ -1186,25 +1184,21 @@ fn write_runtime_script(
     fs::write(&script, content)?;
     Ok(script)
 }
-
-fn gguf_shards(directory: &Path) -> Result<Vec<PathBuf>> {
-    let mut shards = fs::read_dir(directory)
-        .with_context(|| format!("reading model directory {}", directory.display()))?
-        .filter_map(Result::ok)
-        .map(|entry| entry.path())
-        .filter(|path| {
-            path.is_file()
-                && path
-                    .extension()
-                    .is_some_and(|extension| extension.eq_ignore_ascii_case("gguf"))
-        })
-        .collect::<Vec<_>>();
-    shards.sort();
-    if shards.is_empty() {
-        bail!("no GGUF shards found in {}", directory.display());
+fn canonical_model_shards(artifact: &ModelArtifact) -> Result<Vec<PathBuf>> {
+    let mut shards = artifact.shards.clone();
+    for shard in &mut shards {
+        *shard = fs::canonicalize(&*shard)
+            .with_context(|| format!("canonicalizing model shard {}", shard.display()))?;
+    }
+    if shards.len() < 2 {
+        bail!(
+            "Strata streaming launch needs at least two GGUF shards in {}",
+            artifact.directory.display()
+        );
     }
     Ok(shards)
 }
+
 fn select_ple_shard(python: &Path, source: &Path, shards: &[PathBuf]) -> Result<PathBuf> {
     let script = r#"
 import pathlib
@@ -1560,6 +1554,30 @@ mod tests {
         assert!(args.windows(2).any(|pair| pair == ["--kv", "int8"]));
         assert!(!args.contains(&"--kv-resident"));
         assert!(args.windows(2).any(|pair| pair == ["--prefill", "auto"]));
+        let _ = fs::remove_dir_all(root);
+    }
+    #[test]
+    fn prepared_model_ignores_unlisted_gguf_files() {
+        let root = env::temp_dir().join(format!("winstrint-strata-shards-{}", std::process::id()));
+        fs::create_dir_all(&root).expect("test directory");
+        let first = root.join("model-00001.gguf");
+        let second = root.join("model-00002.gguf");
+        let stale = root.join("stale-00003.gguf");
+        for path in [&first, &second, &stale] {
+            fs::write(path, b"fixture").expect("test shard");
+        }
+        let expected = vec![
+            fs::canonicalize(&first).expect("first shard"),
+            fs::canonicalize(&second).expect("second shard"),
+        ];
+        let artifact = ModelArtifact {
+            directory: root.clone(),
+            first_shard: first.clone(),
+            shards: vec![first, second],
+        };
+        let shards = canonical_model_shards(&artifact).expect("manifest shards");
+        assert_eq!(shards, expected);
+        assert!(!shards.contains(&fs::canonicalize(stale).expect("stale shard")));
         let _ = fs::remove_dir_all(root);
     }
 }

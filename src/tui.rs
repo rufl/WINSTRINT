@@ -212,14 +212,29 @@ impl TerminalGuard {
     fn new() -> Result<Self> {
         enable_raw_mode()?;
         let mut output = stdout();
-        execute!(output, EnterAlternateScreen)?;
+        if let Err(error) = execute!(output, EnterAlternateScreen) {
+            let _ = disable_raw_mode();
+            return Err(error.into());
+        }
         let backend = CrosstermBackend::new(output);
-        let mut terminal = Terminal::new(backend)?;
-        terminal.clear()?;
-        Ok(Self {
+        let terminal = match Terminal::new(backend) {
+            Ok(terminal) => terminal,
+            Err(error) => {
+                let _ = disable_raw_mode();
+                let mut output = stdout();
+                let _ = execute!(output, LeaveAlternateScreen);
+                return Err(error.into());
+            }
+        };
+        let mut guard = Self {
             terminal,
             restored: false,
-        })
+        };
+        if let Err(error) = guard.terminal.clear() {
+            let _ = guard.restore();
+            return Err(error.into());
+        }
+        Ok(guard)
     }
     fn restore(&mut self) -> Result<()> {
         if !self.restored {

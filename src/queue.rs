@@ -142,6 +142,7 @@ impl GpuQueue {
         } else {
             QueueState::default()
         };
+        prune_dead_tickets(&mut state);
         let result = operation(&mut state)?;
         let mut file = OpenOptions::new()
             .create(true)
@@ -220,6 +221,47 @@ fn stale_lock(path: &Path) -> bool {
         .and_then(|modified| modified.elapsed().ok())
         .is_some_and(|age| age > Duration::from_secs(300))
 }
+fn prune_dead_tickets(state: &mut QueueState) {
+    if state
+        .active
+        .as_ref()
+        .is_some_and(|ticket| !process_alive(ticket.pid))
+    {
+        state.active = None;
+    }
+    state.waiting.retain(|ticket| process_alive(ticket.pid));
+}
+
+#[cfg(windows)]
+fn process_alive(pid: u32) -> bool {
+    if pid == 0 {
+        return false;
+    }
+    let filter = format!("PID eq {pid}");
+    match Command::new("tasklist")
+        .args(["/FI", &filter, "/FO", "CSV", "/NH"])
+        .output()
+    {
+        Ok(output) if output.status.success() => {
+            let needle = format!("\"{pid}\"");
+            String::from_utf8_lossy(&output.stdout).contains(&needle)
+        }
+        Ok(_) | Err(_) => true,
+    }
+}
+
+#[cfg(not(windows))]
+fn process_alive(pid: u32) -> bool {
+    if pid == 0 {
+        return false;
+    }
+    Command::new("kill")
+        .args(["-0", &pid.to_string()])
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(true)
+}
+
 fn monotonic_id() -> u128 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -231,4 +273,38 @@ fn now_unix_secs() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dead_active_ticket_does_not_block_acquire() {
+        let root = std::env::temp_dir().join(format!("winstrint-queue-test-{}", monotonic_id()));
+        fs::create_dir_all(&root).expect("test directory");
+        let path = root.join("queue.json");
+        fs::write(
+            &path,
+            serde_json::to_vec(&QueueState {
+                active: Some(QueueTicket {
+                    id: "dead".into(),
+                    pid: 0,
+                    purpose: "dead".into(),
+                    acquired_unix_secs: 0,
+                }),
+                waiting: Vec::new(),
+            })
+            .expect("queue JSON"),
+        )
+        .expect("queue state");
+
+        let queue = GpuQueue::new(&path);
+        let lease = queue
+            .acquire("test", false)
+            .expect("dead owner is reclaimed");
+        assert_eq!(lease.ticket().expect("ticket").purpose, "test");
+        lease.release().expect("release");
+        let _ = fs::remove_dir_all(root);
+    }
 }

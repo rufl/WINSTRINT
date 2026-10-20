@@ -136,11 +136,18 @@ fn start_chat(config: &config::AppConfig) -> Result<()> {
         }
         model::ensure_model(config)?
     };
+    let gpu_lease = if matches!(backend, runtime::ResolvedBackend::Cpu) {
+        None
+    } else {
+        let queue = queue::GpuQueue::new(&config.queue_path);
+        Some(queue.acquire(format!("chat-{}", backend.label()), true)?)
+    };
     let fresh = diagnostics::collect()?;
     diagnostics::require_idle(&fresh, config.force, false)?;
     let process = runtime::start(config, &fresh, backend, &artifact)?;
     let result = tui::run(&process.endpoint, "winstrint");
     drop(process);
+    drop(gpu_lease);
     result
 }
 
