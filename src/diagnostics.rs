@@ -63,7 +63,8 @@ pub fn collect() -> Result<Diagnostics> {
         vulkaninfo_available || Path::new(r"C:\Windows\System32\vulkan-1.dll").exists();
     let has_sycl = sycl_ls_available
         || env::var_os("ONEAPI_ROOT").is_some_and(|path| Path::new(&path).exists())
-        || env::var_os("SETVARS_COMPLETED").is_some();
+        || env::var_os("SETVARS_COMPLETED").is_some()
+        || oneapi_setvars().is_some();
     Ok(Diagnostics {
         os_version,
         gpus,
@@ -73,6 +74,32 @@ pub fn collect() -> Result<Diagnostics> {
         sycl_ls_available,
         activity: gpu_activity(),
     })
+}
+
+pub(crate) fn oneapi_setvars() -> Option<PathBuf> {
+    let mut candidates = Vec::new();
+    if let Some(root) = env::var_os("ONEAPI_ROOT") {
+        candidates.push(PathBuf::from(root).join("setvars.bat"));
+    }
+    for variable in ["ProgramFiles(x86)", "ProgramFiles"] {
+        if let Some(root) = env::var_os(variable) {
+            candidates.push(
+                PathBuf::from(root)
+                    .join("Intel")
+                    .join("oneAPI")
+                    .join("setvars.bat"),
+            );
+        }
+    }
+    if let Some(root) = env::var_os("USERPROFILE") {
+        candidates.push(
+            PathBuf::from(root)
+                .join("Intel")
+                .join("oneAPI")
+                .join("setvars.bat"),
+        );
+    }
+    candidates.into_iter().find(|path| path.is_file())
 }
 
 pub fn print_report(diagnostics: &Diagnostics) {

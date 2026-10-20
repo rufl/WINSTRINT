@@ -360,11 +360,17 @@ pub fn validate_for_runtime(config: &AppConfig, target: Option<&GpuInfo>) -> Res
     }
     let model = crate::model::spec(config.model);
     if gpu.adapter_ram_bytes > 0 && model.resident_bytes > gpu.adapter_ram_bytes {
+        let strategy = if matches!(gpu.kind, GpuKind::Arc140T) {
+            "using a mapped expert tier and partial VRAM cache"
+        } else {
+            "using streamed experts and a host mirror"
+        };
         println!(
-            "Strata: {} needs {:.1} GiB resident and this GPU reports {:.1} GiB; using streamed experts and a host mirror",
+            "Strata: {} needs {:.1} GiB resident and this GPU reports {:.1} GiB; {}",
             config.model.key(),
             model.resident_bytes as f64 / 1e9,
-            gpu.adapter_ram_bytes as f64 / 1e9
+            gpu.adapter_ram_bytes as f64 / 1e9,
+            strategy
         );
     }
     preflight_native_toolchain()
@@ -381,13 +387,19 @@ pub fn prepare_launch(
     let engine = ensure_engine(config, &source, false)?;
     let model = prepare_model(config, &source, &python, artifact)?;
     let alchemist = target.is_some_and(|gpu| matches!(gpu.kind, GpuKind::A770));
-    let config_path = write_server_config(config, &source, &engine, &model, alchemist)?;
+    let arc140t = target.is_some_and(|gpu| matches!(gpu.kind, GpuKind::Arc140T));
+    let config_path = write_server_config(&config, &source, &engine, &model, alchemist, arc140t)?;
     let setvars = find_setvars().context("locating Intel oneAPI setvars.bat")?;
     let script = write_runtime_script(config, &source, &python, &setvars, &config_path, &engine)?;
-    let command = format!("call {}", batch_quote(&script));
     Ok(StrataLaunch {
         program: PathBuf::from("cmd.exe"),
-        args: vec![os("/D"), os("/S"), os("/C"), OsString::from(command)],
+        args: vec![
+            os("/D"),
+            os("/S"),
+            os("/C"),
+            os("call"),
+            script.into_os_string(),
+        ],
         cwd: source,
         log_path: log_root(config).join("strata-runtime.log"),
         health_timeout: ENGINE_HEALTH_TIMEOUT,
@@ -429,29 +441,7 @@ fn preflight_native_toolchain() -> Result<()> {
 }
 
 fn find_setvars() -> Option<PathBuf> {
-    let mut candidates = Vec::new();
-    if let Some(root) = env::var_os("ONEAPI_ROOT") {
-        candidates.push(PathBuf::from(root).join("setvars.bat"));
-    }
-    for variable in ["ProgramFiles(x86)", "ProgramFiles"] {
-        if let Some(root) = env::var_os(variable) {
-            candidates.push(
-                PathBuf::from(root)
-                    .join("Intel")
-                    .join("oneAPI")
-                    .join("setvars.bat"),
-            );
-        }
-    }
-    if let Some(root) = env::var_os("USERPROFILE") {
-        candidates.push(
-            PathBuf::from(root)
-                .join("Intel")
-                .join("oneAPI")
-                .join("setvars.bat"),
-        );
-    }
-    candidates.into_iter().find(|path| path.is_file())
+    crate::diagnostics::oneapi_setvars()
 }
 
 fn ensure_source(config: &AppConfig) -> Result<PathBuf> {
@@ -950,7 +940,7 @@ fn prepare_model(
                 os("--gguf"),
                 first_shard.clone().into_os_string(),
                 os("--out"),
-                tokenizer.clone().into_os_string(),
+                pack_root.clone().into_os_string(),
             ],
             source,
             "creating the Strata tokenizer bundle",
@@ -1038,7 +1028,7 @@ fn host_memory_gib() -> Option<f64> {
     if !cfg!(windows) {
         return None;
     }
-    let output = Command::new("powershell.exe")
+    if let Ok(output) = Command::new("powershell.exe")
         .args([
             "-NoProfile",
             "-NonInteractive",
@@ -1046,15 +1036,46 @@ fn host_memory_gib() -> Option<f64> {
             "(Get-CimInstance Win32_ComputerSystem).TotalPhysicalMemory",
         ])
         .output()
+    {
+        if output.status.success() {
+            if let Ok(bytes) = String::from_utf8_lossy(&output.stdout)
+                .trim()
+                .parse::<u64>()
+            {
+                return Some(bytes as f64 / 1_073_741_824.0);
+            }
+        }
+    }
+    let output = Command::new("cmd.exe")
+        .args(["/D", "/C", "systeminfo"])
+        .output()
         .ok()?;
     if !output.status.success() {
         return None;
     }
-    let bytes = String::from_utf8_lossy(&output.stdout)
-        .trim()
-        .parse::<u64>()
-        .ok()?;
-    Some(bytes as f64 / 1_073_741_824.0)
+    parse_systeminfo_memory_mib(&String::from_utf8_lossy(&output.stdout))
+        .map(|mib| mib as f64 / 1024.0)
+}
+
+fn parse_systeminfo_memory_mib(text: &str) -> Option<u64> {
+    let value = text.lines().find_map(|line| {
+        let (key, value) = line.split_once(':')?;
+        key.trim()
+            .eq_ignore_ascii_case("Total Physical Memory")
+            .then_some(value.trim())
+    })?;
+    let mut fields = value.split_whitespace();
+    let number = fields.next()?;
+    let unit = fields.next().unwrap_or("MB").to_ascii_lowercase();
+    let digits: String = number.chars().filter(char::is_ascii_digit).collect();
+    let amount = digits.parse::<u64>().ok()?;
+    match unit.as_str() {
+        "kb" => Some(amount / 1024),
+        "mb" => Some(amount),
+        "gb" => amount.checked_mul(1024),
+        "tb" => amount.checked_mul(1024 * 1024),
+        _ => None,
+    }
 }
 
 fn use_streamed_kv(context: u32, host_ram_gib: Option<f64>) -> bool {
@@ -1071,13 +1092,16 @@ fn write_server_config(
     engine: &Path,
     model: &PreparedModel,
     alchemist: bool,
+    arc140t: bool,
 ) -> Result<PathBuf> {
     let directory = strata_root(config).join("configs");
     fs::create_dir_all(&directory)?;
     let path = directory.join(format!("{}.json", config.model.key()));
     let log = log_root(config).join("strata-engine.log");
     fs::create_dir_all(log_root(config))?;
-    let reserve = if config.context <= 32_768 {
+    let reserve = if arc140t {
+        "2048"
+    } else if config.context <= 32_768 {
         "1024"
     } else {
         "2048"
@@ -1107,10 +1131,16 @@ fn write_server_config(
     ] {
         environment.insert(key.to_string(), json!(value));
     }
-    if alchemist {
-        environment.insert("IGC_EnableDPEmulation".into(), json!("1"));
-        environment.insert("OverrideDefaultFP64Settings".into(), json!("1"));
-        environment.insert("NEOReadDebugKeys".into(), json!("1"));
+    if arc140t {
+        // Arc 140T is an integrated 8-Xe-core GPU with shared system memory.
+        // Map the GGUF expert spans instead of committing a 23 GiB resident
+        // arena; this leaves Windows enough RAM to keep serving requests.
+        environment.insert("STRATA_VERIFY_DEVICE_PLAN".into(), json!("0"));
+        environment.insert("STRATA_VERIFY_EAGER".into(), json!("1"));
+        // Shared-memory verification can take longer than the stock 20-second
+        // ring timeout while the iGPU and CPU pool drain a window.
+        environment.insert("STRATA_RING_TIMEOUT_S".into(), json!("120"));
+        environment.insert("STRATA_VERIFY_NO_HOST".into(), json!("0"));
     }
     let mut args = vec![
         "--pack".to_string(),
@@ -1123,22 +1153,37 @@ fn write_server_config(
         path_string(&model.profile),
         "--expert-cache".to_string(),
         "auto".to_string(),
-        "--stream-experts".to_string(),
         "--vram-reserve-mib".to_string(),
         reserve.to_string(),
         "--prefill".to_string(),
         prefill.to_string(),
         "--spec".to_string(),
         "4".to_string(),
-        "--spec-min-p".to_string(),
-        "0.5".to_string(),
-        "--mtp".to_string(),
-        path_string(&model.mtp_runtime),
-        "--kv".to_string(),
-        "int8".to_string(),
     ];
+    if arc140t {
+        args.push("--mmap-experts".to_string());
+    }
+    if !arc140t {
+        args.extend([
+            "--spec-min-p".to_string(),
+            "0.5".to_string(),
+            "--mtp".to_string(),
+            path_string(&model.mtp_runtime),
+        ]);
+    }
+    args.extend(["--kv".to_string(), "int8".to_string()]);
+    if alchemist {
+        environment.insert("IGC_EnableDPEmulation".into(), json!("1"));
+        environment.insert("OverrideDefaultFP64Settings".into(), json!("1"));
+        environment.insert("NEOReadDebugKeys".into(), json!("1"));
+    }
     if streamed_kv {
         args.extend(["--kv-resident".to_string(), "32768".to_string()]);
+    }
+    if arc140t {
+        // Keep expert misses on the mapped GGUF file tier; the Windows
+        // Level Zero pinned-host mirror path is unstable on this iGPU.
+        args.extend(["--pcie-frac".to_string(), "0".to_string()]);
     }
     args.extend(["--max-context".to_string(), config.context.to_string()]);
     let value = json!({
@@ -1501,6 +1546,22 @@ mod tests {
     }
 
     #[test]
+    fn systeminfo_memory_parser_handles_windows_units() {
+        assert_eq!(
+            parse_systeminfo_memory_mib("Total Physical Memory: 32,189 MB"),
+            Some(32_189)
+        );
+        assert_eq!(
+            parse_systeminfo_memory_mib("Total Physical Memory: 64 GB"),
+            Some(65_536)
+        );
+        assert_eq!(
+            parse_systeminfo_memory_mib("Available Physical Memory: 8,000 MB"),
+            None
+        );
+    }
+
+    #[test]
     fn generated_config_keeps_model_template_and_runtime_defaults() {
         let root = env::temp_dir().join(format!(
             "winstrint-strata-config-test-{}",
@@ -1534,6 +1595,7 @@ mod tests {
             Path::new("strata.exe"),
             &model,
             false,
+            false,
         )
         .expect("config generation");
         let value: Value = serde_json::from_slice(&fs::read(&path).expect("generated config"))
@@ -1554,6 +1616,33 @@ mod tests {
         assert!(args.windows(2).any(|pair| pair == ["--kv", "int8"]));
         assert!(!args.contains(&"--kv-resident"));
         assert!(args.windows(2).any(|pair| pair == ["--prefill", "auto"]));
+        assert!(!args.contains(&"--mmap-experts"));
+        let arc_path = write_server_config(
+            &config,
+            Path::new("source"),
+            Path::new("strata.exe"),
+            &model,
+            false,
+            true,
+        )
+        .expect("Arc 140T config generation");
+        let arc_value: Value =
+            serde_json::from_slice(&fs::read(arc_path).expect("Arc 140T generated config"))
+                .expect("valid Arc 140T JSON");
+        assert_eq!(arc_value["env"]["STRATA_VERIFY_DEVICE_PLAN"], "0");
+        assert_eq!(arc_value["env"]["STRATA_VERIFY_EAGER"], "1");
+        assert_eq!(arc_value["env"]["STRATA_RING_TIMEOUT_S"], "120");
+        assert_eq!(arc_value["env"]["STRATA_VERIFY_NO_HOST"], "0");
+        let arc_args = arc_value["args"]
+            .as_array()
+            .expect("Arc 140T args array")
+            .iter()
+            .map(|item| item.as_str().expect("Arc 140T string arg"))
+            .collect::<Vec<_>>();
+        assert!(!arc_args.contains(&"--stream-experts"));
+        assert!(arc_args.contains(&"--mmap-experts"));
+        assert!(!arc_args.contains(&"--mtp"));
+        assert!(arc_args.windows(2).any(|pair| pair == ["--pcie-frac", "0"]));
         let _ = fs::remove_dir_all(root);
     }
     #[test]

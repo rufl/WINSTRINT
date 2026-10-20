@@ -1,3 +1,4 @@
+use std::ffi::{OsStr, OsString};
 use std::fs::{self, File, OpenOptions};
 use std::io;
 use std::path::{Component, Path, PathBuf};
@@ -202,19 +203,17 @@ pub fn select_backend(config: &AppConfig, diagnostics: &Diagnostics) -> Result<R
             let candidate = match target.map(|gpu| gpu.kind) {
                 Some(GpuKind::A770) if diagnostics.has_sycl => ResolvedBackend::LlamaSycl,
                 Some(GpuKind::A770) if diagnostics.has_vulkan => ResolvedBackend::LlamaVulkan,
-                Some(GpuKind::Arc140T) if diagnostics.has_vulkan => ResolvedBackend::LlamaVulkan,
                 Some(GpuKind::Arc140T) if diagnostics.has_sycl => ResolvedBackend::LlamaSycl,
+                Some(GpuKind::Arc140T) if diagnostics.has_vulkan => ResolvedBackend::LlamaVulkan,
                 Some(GpuKind::OtherIntel) if diagnostics.has_vulkan => ResolvedBackend::LlamaVulkan,
                 Some(GpuKind::OtherIntel) if diagnostics.has_sycl => ResolvedBackend::LlamaSycl,
                 _ if diagnostics.has_vulkan => ResolvedBackend::LlamaVulkan,
                 _ if diagnostics.has_sycl => ResolvedBackend::LlamaSycl,
                 _ => anyhow::bail!("no usable SYCL or Vulkan backend was detected"),
             };
-            // This guard is only for llama.cpp, which cannot stream this model's experts.
-            if matches!(
-                candidate,
-                ResolvedBackend::LlamaSycl | ResolvedBackend::LlamaVulkan
-            ) {
+            // Vulkan cannot stream this model's experts; the SYCL path keeps them on the host
+            // and offloads one dense layer to the Arc device.
+            if matches!(candidate, ResolvedBackend::LlamaVulkan) {
                 let model = model::spec(config.model);
                 if let Some(gpu) = target
                     && gpu.adapter_ram_bytes > 0
@@ -361,56 +360,96 @@ fn start_llama_process(
         .create(true)
         .append(true)
         .open(log_path)?;
-    let mut command = Command::new(executable);
-    command
-        .current_dir(executable.parent().unwrap_or_else(|| Path::new(".")))
-        .arg("--model")
-        .arg(&artifact.first_shard)
-        .arg("--host")
-        .arg("127.0.0.1")
-        .arg("--port")
-        .arg(config.port.to_string())
-        .arg("--ctx-size")
-        .arg(config.context.to_string())
-        .arg("--parallel")
-        .arg("1")
-        .stdout(Stdio::from(log.try_clone()?))
-        .stderr(Stdio::from(log));
+    let mut args = vec![
+        OsString::from("--model"),
+        artifact.first_shard.clone().into_os_string(),
+        OsString::from("--host"),
+        OsString::from("127.0.0.1"),
+        OsString::from("--port"),
+        config.port.to_string().into(),
+        OsString::from("--ctx-size"),
+        config.context.to_string().into(),
+        OsString::from("--parallel"),
+        OsString::from("1"),
+    ];
     match launch {
-        LlamaLaunch::Gpu(backend) => {
-            command
-                .arg("--n-gpu-layers")
-                .arg("auto")
-                .arg("--fit")
-                .arg("on")
-                .arg("--moe-cache-mib")
-                .arg(recommended_cache_mib(diagnostics).to_string());
-            match backend {
-                ResolvedBackend::LlamaSycl => {
-                    command
-                        .arg("--device")
-                        .arg("SYCL0")
-                        .env("ONEAPI_DEVICE_SELECTOR", "level_zero:0")
-                        .env("SYCL_CACHE_PERSISTENT", "0");
-                }
-                ResolvedBackend::LlamaVulkan => {
-                    command.arg("--device").arg("Vulkan0");
-                }
-                ResolvedBackend::Cpu | ResolvedBackend::Strata => unreachable!(),
+        LlamaLaunch::Gpu(backend) => match backend {
+            ResolvedBackend::LlamaSycl => {
+                let (generation_threads, batch_threads) = sycl_thread_counts(diagnostics);
+                let (batch_size, ubatch_size) = sycl_batch_sizes(diagnostics);
+                args.extend(["--threads"].into_iter().map(OsString::from));
+                args.push(generation_threads.to_string().into());
+                args.extend(["--threads-batch"].into_iter().map(OsString::from));
+                args.push(batch_threads.to_string().into());
+                args.extend(["--batch-size"].into_iter().map(OsString::from));
+                args.push(batch_size.to_string().into());
+                args.extend(["--ubatch-size"].into_iter().map(OsString::from));
+                args.push(ubatch_size.to_string().into());
+                args.extend(
+                    [
+                        "--n-gpu-layers",
+                        "1",
+                        "--cpu-moe",
+                        "--device",
+                        "SYCL0",
+                        "--no-kv-offload",
+                        "--no-op-offload",
+                        "--moe-cache-mib",
+                        "0",
+                    ]
+                    .into_iter()
+                    .map(OsString::from),
+                );
             }
-        }
+            ResolvedBackend::LlamaVulkan => {
+                args.extend(
+                    ["--n-gpu-layers", "auto", "--fit", "on", "--moe-cache-mib"]
+                        .into_iter()
+                        .map(OsString::from),
+                );
+                args.push(recommended_cache_mib(diagnostics).to_string().into());
+                args.extend(["--device", "Vulkan0"].into_iter().map(OsString::from));
+            }
+            ResolvedBackend::Cpu | ResolvedBackend::Strata => unreachable!(),
+        },
         LlamaLaunch::Cpu => {
-            command
-                .arg("--n-gpu-layers")
-                .arg("0")
-                .arg("--device")
-                .arg("none")
-                .arg("--no-kv-offload")
-                .arg("--no-op-offload")
-                .arg("--moe-cache-mib")
-                .arg("0");
+            let (generation_threads, batch_threads) = cpu_thread_counts();
+            args.extend(["--threads"].into_iter().map(OsString::from));
+            args.push(generation_threads.to_string().into());
+            args.extend(["--threads-batch"].into_iter().map(OsString::from));
+            args.push(batch_threads.to_string().into());
+            args.extend(
+                [
+                    "--n-gpu-layers",
+                    "0",
+                    "--device",
+                    "none",
+                    "--no-kv-offload",
+                    "--no-op-offload",
+                    "--moe-cache-mib",
+                    "0",
+                ]
+                .into_iter()
+                .map(OsString::from),
+            );
         }
     }
+    let mut command = if matches!(launch, LlamaLaunch::Gpu(ResolvedBackend::LlamaSycl)) {
+        let setvars = diagnostics::oneapi_setvars()
+            .context("Intel oneAPI setvars.bat is missing; cannot start SYCL")?;
+        let script = write_sycl_runtime_script(log_path, &setvars, executable, &args)?;
+        let mut command = Command::new("cmd.exe");
+        command.args(["/D", "/S", "/C", "call"]).arg(script);
+        command
+    } else {
+        let mut command = Command::new(executable);
+        command.args(&args);
+        command
+    };
+    command
+        .current_dir(executable.parent().unwrap_or_else(|| Path::new(".")))
+        .stdout(Stdio::from(log.try_clone()?))
+        .stderr(Stdio::from(log));
     println!("Starting {}", launch.label());
     println!("Model: {}", artifact.first_shard.display());
     println!("Runtime log: {}", log_path.display());
@@ -427,6 +466,67 @@ fn start_llama_process(
         _process_tree: process_tree,
         endpoint,
     })
+}
+
+fn write_sycl_runtime_script(
+    log_path: &Path,
+    setvars: &Path,
+    executable: &Path,
+    args: &[OsString],
+) -> Result<PathBuf> {
+    let script = log_path.with_file_name("llama-sycl-runtime.cmd");
+    let mut content = format!(
+        "@echo off\r\nsetlocal\r\ncall {} intel64 vs2022\r\nif errorlevel 1 exit /b %errorlevel%\r\nset \"ONEAPI_DEVICE_SELECTOR=level_zero:0\"\r\nset \"SYCL_CACHE_PERSISTENT=0\"\r\n{}",
+        cmd_quote(setvars.as_os_str()),
+        cmd_quote(executable.as_os_str())
+    );
+    for arg in args {
+        content.push(' ');
+        content.push_str(&cmd_quote(arg));
+    }
+    content.push_str("\r\nexit /b %errorlevel%\r\n");
+    fs::write(&script, content)?;
+    Ok(script)
+}
+
+fn cpu_thread_counts() -> (usize, usize) {
+    // Keep the conservative half-pool default for CPU fallback and other
+    // targets; the Arc 140T SYCL path overrides only its decode workers.
+    let batch_threads = std::thread::available_parallelism()
+        .map(|count| count.get())
+        .unwrap_or(16);
+    (batch_threads.div_ceil(2).max(1), batch_threads)
+}
+
+fn sycl_thread_counts(diagnostics: &Diagnostics) -> (usize, usize) {
+    let (default_generation_threads, batch_threads) = cpu_thread_counts();
+    if matches!(
+        diagnostics::target_gpu(diagnostics).map(|gpu| gpu.kind),
+        Some(GpuKind::Arc140T)
+    ) {
+        // This MoE workload is memory-bound on Arc 140T: three-fourths of the
+        // workers decode faster, while the full pool remains for prompts.
+        ((batch_threads * 3 / 4).max(1), batch_threads)
+    } else {
+        (default_generation_threads, batch_threads)
+    }
+}
+
+fn sycl_batch_sizes(diagnostics: &Diagnostics) -> (usize, usize) {
+    if matches!(
+        diagnostics::target_gpu(diagnostics).map(|gpu| gpu.kind),
+        Some(GpuKind::Arc140T)
+    ) {
+        // Larger prompt batches reduce repeated host-to-device expert trips on
+        // this shared-memory iGPU; keep the tested values Arc-specific.
+        (8192, 4096)
+    } else {
+        (64, 64)
+    }
+}
+
+fn cmd_quote(value: &OsStr) -> String {
+    format!("\"{}\"", value.to_string_lossy().replace('"', "\"\""))
 }
 
 fn start_strata(
@@ -517,6 +617,8 @@ fn strata_backend(
     config: &AppConfig,
     target: Option<&crate::diagnostics::GpuInfo>,
 ) -> Result<ResolvedBackend> {
+    // Arc 140T is an integrated Arc GPU with shared system memory. Its native
+    // Strata path uses a mapped expert tier and a partial VRAM cache.
     strata::validate_for_runtime(config, target)?;
     Ok(ResolvedBackend::Strata)
 }
