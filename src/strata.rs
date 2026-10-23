@@ -1575,8 +1575,10 @@ mod tests {
             queue_path: root.join("queue.json"),
             backend: crate::config::BackendPreference::Strata,
             model: ModelChoice::Coder,
+            model_path: None,
             port: 8080,
             context: 4096,
+            decode_profile: crate::config::DecodeProfile::Auto,
             force: false,
             no_download: true,
             yes: true,
@@ -1663,6 +1665,7 @@ mod tests {
             directory: root.clone(),
             first_shard: first.clone(),
             shards: vec![first, second],
+            supports_moe_cache: false,
         };
         let shards = canonical_model_shards(&artifact).expect("manifest shards");
         assert_eq!(shards, expected);

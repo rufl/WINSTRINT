@@ -11,7 +11,7 @@ use reqwest::blocking::Client;
 use serde_json::json;
 use zip::ZipArchive;
 
-use crate::config::{AppConfig, BackendPreference};
+use crate::config::{AppConfig, BackendPreference, DecodeProfile};
 use crate::diagnostics::{self, Diagnostics, GpuKind};
 use crate::model::{self, ModelArtifact};
 use crate::strata;
@@ -213,7 +213,7 @@ pub fn select_backend(config: &AppConfig, diagnostics: &Diagnostics) -> Result<R
             };
             // Vulkan cannot stream this model's experts; the SYCL path keeps them on the host
             // and offloads one dense layer to the Arc device.
-            if matches!(candidate, ResolvedBackend::LlamaVulkan) {
+            if config.model_path.is_none() && matches!(candidate, ResolvedBackend::LlamaVulkan) {
                 let model = model::spec(config.model);
                 if let Some(gpu) = target
                     && gpu.adapter_ram_bytes > 0
@@ -238,11 +238,51 @@ pub fn start(
     backend: ResolvedBackend,
     artifact: &ModelArtifact,
 ) -> Result<RuntimeProcess> {
+    start_with_profile_mode(
+        config,
+        diagnostics,
+        backend,
+        artifact,
+        config.decode_profile,
+        true,
+    )
+}
+
+pub fn start_with_profile(
+    config: &AppConfig,
+    diagnostics: &Diagnostics,
+    backend: ResolvedBackend,
+    artifact: &ModelArtifact,
+    profile: DecodeProfile,
+) -> Result<RuntimeProcess> {
+    start_with_profile_mode(config, diagnostics, backend, artifact, profile, false)
+}
+
+fn start_with_profile_mode(
+    config: &AppConfig,
+    diagnostics: &Diagnostics,
+    backend: ResolvedBackend,
+    artifact: &ModelArtifact,
+    profile: DecodeProfile,
+    allow_cpu_fallback: bool,
+) -> Result<RuntimeProcess> {
     match backend {
         ResolvedBackend::Cpu | ResolvedBackend::LlamaSycl | ResolvedBackend::LlamaVulkan => {
-            start_llama(config, diagnostics, backend, artifact)
+            start_llama(
+                config,
+                diagnostics,
+                backend,
+                artifact,
+                profile,
+                allow_cpu_fallback,
+            )
         }
-        ResolvedBackend::Strata => start_strata(config, diagnostics, artifact),
+        ResolvedBackend::Strata => {
+            if !matches!(profile, DecodeProfile::Auto) {
+                anyhow::bail!("decode profiles are supported by llama.cpp backends only");
+            }
+            start_strata(config, diagnostics, artifact)
+        }
     }
 }
 
@@ -298,6 +338,8 @@ fn start_llama(
     diagnostics: &Diagnostics,
     backend: ResolvedBackend,
     artifact: &ModelArtifact,
+    profile: DecodeProfile,
+    allow_cpu_fallback: bool,
 ) -> Result<RuntimeProcess> {
     let executable = ensure_llama_bundle(config, backend)?;
     let log_dir = config.data_dir.join("logs");
@@ -317,34 +359,40 @@ fn start_llama(
             &executable,
             &log_path,
             launch,
+            DecodeProfile::Auto,
         ),
-        LlamaLaunch::Gpu(gpu_backend) => match start_llama_process(
-            config,
-            diagnostics,
-            artifact,
-            &executable,
-            &log_path,
-            launch,
-        ) {
-            Ok(process) => Ok(process),
-            Err(error) => {
-                eprintln!("{} could not load the model: {error}", gpu_backend.label());
-                eprintln!(
-                    "Falling back to CPU execution; startup can take several minutes for this model."
-                );
-                start_llama_process(
-                    config,
-                    diagnostics,
-                    artifact,
-                    &executable,
-                    &log_path,
-                    LlamaLaunch::Cpu,
-                )
-                .with_context(|| {
-                    format!("starting CPU fallback after {} failed", gpu_backend.label())
-                })
+        LlamaLaunch::Gpu(gpu_backend) => {
+            match start_llama_process(
+                config,
+                diagnostics,
+                artifact,
+                &executable,
+                &log_path,
+                launch,
+                profile,
+            ) {
+                Ok(process) => Ok(process),
+                Err(error) if allow_cpu_fallback => {
+                    eprintln!("{} could not load the model: {error}", gpu_backend.label());
+                    eprintln!(
+                        "Falling back to CPU execution; startup can take several minutes for this model."
+                    );
+                    start_llama_process(
+                        config,
+                        diagnostics,
+                        artifact,
+                        &executable,
+                        &log_path,
+                        LlamaLaunch::Cpu,
+                        DecodeProfile::Auto,
+                    )
+                    .with_context(|| {
+                        format!("starting CPU fallback after {} failed", gpu_backend.label())
+                    })
+                }
+                Err(error) => Err(error),
             }
-        },
+        }
     }
 }
 
@@ -355,6 +403,7 @@ fn start_llama_process(
     executable: &Path,
     log_path: &Path,
     launch: LlamaLaunch,
+    profile: DecodeProfile,
 ) -> Result<RuntimeProcess> {
     let log = OpenOptions::new()
         .create(true)
@@ -377,6 +426,16 @@ fn start_llama_process(
             ResolvedBackend::LlamaSycl => {
                 let (generation_threads, batch_threads) = sycl_thread_counts(diagnostics);
                 let (batch_size, ubatch_size) = sycl_batch_sizes(diagnostics);
+                let discrete_a770 = sycl_has_discrete_a770(diagnostics);
+                let gpu_layers = if discrete_a770 {
+                    // The A770 can hold the dense layers of this MoE model.
+                    // Keeping only one layer on the device leaves every other
+                    // dense operation on the CPU and makes the eGPU mostly
+                    // pay Thunderbolt transfer overhead.
+                    "99"
+                } else {
+                    "1"
+                };
                 args.extend(["--threads"].into_iter().map(OsString::from));
                 args.push(generation_threads.to_string().into());
                 args.extend(["--threads-batch"].into_iter().map(OsString::from));
@@ -388,26 +447,73 @@ fn start_llama_process(
                 args.extend(
                     [
                         "--n-gpu-layers",
-                        "1",
+                        gpu_layers,
                         "--cpu-moe",
                         "--device",
                         "SYCL0",
-                        "--no-kv-offload",
-                        "--no-op-offload",
-                        "--moe-cache-mib",
-                        "0",
                     ]
                     .into_iter()
                     .map(OsString::from),
                 );
+                let profile = if matches!(profile, DecodeProfile::Auto) {
+                    if discrete_a770 {
+                        DecodeProfile::Q8Kv
+                    } else {
+                        DecodeProfile::NoKv
+                    }
+                } else {
+                    profile
+                };
+                match profile {
+                    DecodeProfile::NoKv => args.extend(
+                        ["--no-kv-offload", "--no-op-offload"]
+                            .into_iter()
+                            .map(OsString::from),
+                    ),
+                    DecodeProfile::Q8Kv => args.extend(
+                        ["--cache-type-k", "q8_0", "--cache-type-v", "q8_0"]
+                            .into_iter()
+                            .map(OsString::from),
+                    ),
+                    DecodeProfile::Q4Kv => args.extend(
+                        ["--cache-type-k", "q4_0", "--cache-type-v", "q4_0"]
+                            .into_iter()
+                            .map(OsString::from),
+                    ),
+                    DecodeProfile::Q8NoOp => {
+                        args.extend(
+                            ["--cache-type-k", "q8_0", "--cache-type-v", "q8_0"]
+                                .into_iter()
+                                .map(OsString::from),
+                        );
+                        args.extend(["--no-op-offload"].into_iter().map(OsString::from));
+                    }
+                    DecodeProfile::Q8Ngram => {
+                        args.extend(
+                            ["--cache-type-k", "q8_0", "--cache-type-v", "q8_0"]
+                                .into_iter()
+                                .map(OsString::from),
+                        );
+                        args.extend(
+                            ["--spec-type", "ngram-simple"]
+                                .into_iter()
+                                .map(OsString::from),
+                        );
+                    }
+                    DecodeProfile::Auto => unreachable!("auto profile is resolved above"),
+                }
+                args.extend(["--moe-cache-mib", "0"].into_iter().map(OsString::from));
             }
             ResolvedBackend::LlamaVulkan => {
                 args.extend(
-                    ["--n-gpu-layers", "auto", "--fit", "on", "--moe-cache-mib"]
+                    ["--n-gpu-layers", "auto", "--fit", "on"]
                         .into_iter()
                         .map(OsString::from),
                 );
-                args.push(recommended_cache_mib(diagnostics).to_string().into());
+                if artifact.supports_moe_cache {
+                    args.extend(["--moe-cache-mib"].into_iter().map(OsString::from));
+                    args.push(recommended_cache_mib(diagnostics).to_string().into());
+                }
                 args.extend(["--device", "Vulkan0"].into_iter().map(OsString::from));
             }
             ResolvedBackend::Cpu | ResolvedBackend::Strata => unreachable!(),
@@ -498,13 +604,23 @@ fn cpu_thread_counts() -> (usize, usize) {
     (batch_threads.div_ceil(2).max(1), batch_threads)
 }
 
+fn sycl_has_discrete_a770(diagnostics: &Diagnostics) -> bool {
+    // The SYCL script selects Level Zero device 0.  On the dual-GPU Arc
+    // workstation this is the A770; keep the discrete profile independent of
+    // WMI display-adapter ordering, which lists the iGPU first.
+    diagnostics
+        .gpus
+        .iter()
+        .any(|gpu| matches!(gpu.kind, GpuKind::A770))
+}
+
 fn sycl_thread_counts(diagnostics: &Diagnostics) -> (usize, usize) {
     let (default_generation_threads, batch_threads) = cpu_thread_counts();
     if matches!(
         diagnostics::target_gpu(diagnostics).map(|gpu| gpu.kind),
-        Some(GpuKind::Arc140T)
+        Some(GpuKind::Arc140T | GpuKind::A770)
     ) {
-        // This MoE workload is memory-bound on Arc 140T: three-fourths of the
+        // This MoE workload is memory-bound on Arc GPUs: three-fourths of the
         // workers decode faster, while the full pool remains for prompts.
         ((batch_threads * 3 / 4).max(1), batch_threads)
     } else {
@@ -515,10 +631,11 @@ fn sycl_thread_counts(diagnostics: &Diagnostics) -> (usize, usize) {
 fn sycl_batch_sizes(diagnostics: &Diagnostics) -> (usize, usize) {
     if matches!(
         diagnostics::target_gpu(diagnostics).map(|gpu| gpu.kind),
-        Some(GpuKind::Arc140T)
+        Some(GpuKind::Arc140T | GpuKind::A770)
     ) {
         // Larger prompt batches reduce repeated host-to-device expert trips on
-        // this shared-memory iGPU; keep the tested values Arc-specific.
+        // Arc GPUs; keep the tested values for both integrated and discrete
+        // adapters.
         (8192, 4096)
     } else {
         (64, 64)
@@ -617,6 +734,11 @@ fn strata_backend(
     config: &AppConfig,
     target: Option<&crate::diagnostics::GpuInfo>,
 ) -> Result<ResolvedBackend> {
+    if config.model_path.is_some() {
+        anyhow::bail!(
+            "--model-path is supported by llama.cpp backends only; Strata requires a managed model"
+        );
+    }
     // Arc 140T is an integrated Arc GPU with shared system memory. Its native
     // Strata path uses a mapped expert tier and a partial VRAM cache.
     strata::validate_for_runtime(config, target)?;

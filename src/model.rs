@@ -87,6 +87,36 @@ pub struct ModelArtifact {
     pub directory: PathBuf,
     pub first_shard: PathBuf,
     pub shards: Vec<PathBuf>,
+    pub supports_moe_cache: bool,
+}
+
+pub fn external_model(path: &Path) -> Result<ModelArtifact> {
+    let metadata = fs::symlink_metadata(path)
+        .with_context(|| format!("checking external model {}", path.display()))?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        anyhow::bail!("external model {} is not a normal file", path.display());
+    }
+    if !path
+        .extension()
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("gguf"))
+    {
+        anyhow::bail!("external model {} is not a GGUF file", path.display());
+    }
+    if metadata.len() == 0 {
+        anyhow::bail!("external model {} is empty", path.display());
+    }
+    let first_shard = fs::canonicalize(path)
+        .with_context(|| format!("canonicalizing external model {}", path.display()))?;
+    let directory = first_shard
+        .parent()
+        .map(Path::to_path_buf)
+        .context("external model has no parent directory")?;
+    Ok(ModelArtifact {
+        directory,
+        first_shard: first_shard.clone(),
+        shards: vec![first_shard],
+        supports_moe_cache: false,
+    })
 }
 
 #[derive(Deserialize)]
@@ -247,6 +277,7 @@ pub fn ensure_model(config: &AppConfig) -> Result<ModelArtifact> {
         directory,
         first_shard,
         shards: files,
+        supports_moe_cache: true,
     })
 }
 
@@ -345,6 +376,7 @@ pub fn cached_model(config: &AppConfig) -> Result<ModelArtifact> {
         directory,
         first_shard,
         shards: files,
+        supports_moe_cache: true,
     })
 }
 
@@ -560,5 +592,22 @@ mod tests {
 
         let base = spec(ModelChoice::Q2_0);
         assert!(!compatible_revision(base, LEGACY_CODER_MODEL_REVISION));
+    }
+
+    #[test]
+    fn external_model_disables_moe_cache_and_canonicalizes_path() {
+        let path = std::env::temp_dir().join(format!(
+            "winstrint-external-model-{}.gguf",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        std::fs::write(&path, b"fixture").expect("external model fixture");
+        let artifact = external_model(&path).expect("external GGUF");
+        assert_eq!(
+            artifact.first_shard,
+            std::fs::canonicalize(&path).expect("canonical fixture")
+        );
+        assert!(!artifact.supports_moe_cache);
+        let _ = std::fs::remove_file(path);
     }
 }

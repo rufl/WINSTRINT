@@ -1,10 +1,14 @@
+mod bios;
 mod config;
 mod diagnostics;
+mod firmware;
 mod model;
 mod queue;
+mod rebar;
 mod runtime;
 mod strata;
 mod tui;
+mod tune;
 
 use std::io::{self, Write};
 
@@ -31,6 +35,9 @@ fn run() -> Result<()> {
             Ok(())
         }
         Some(Command::Download) => {
+            if config.model_path.is_some() {
+                anyhow::bail!("--model-path is only valid with chat");
+            }
             config.ensure_dirs()?;
             let diagnostics = diagnostics::collect()?;
             diagnostics::print_report(&diagnostics);
@@ -103,6 +110,10 @@ fn run() -> Result<()> {
             strata::probe(&config, config.force).map(|_| ())
         }
         Some(Command::StrataStatus { verify }) => strata::print_status(&config, verify),
+        Some(Command::TuneDecode(args)) => tune::run(&config, &args),
+        Some(Command::RebarUefi(args)) => rebar::run(&config, &args),
+        Some(Command::FirmwareInspect(args)) => firmware::run(&args),
+        Some(Command::BiosDowngrade(args)) => bios::run(&config, &args),
         Some(Command::Chat) | None => start_chat(&config),
     }
 }
@@ -113,8 +124,14 @@ fn start_chat(config: &config::AppConfig) -> Result<()> {
     diagnostics::print_report(&diagnostics);
     let backend = runtime::select_backend(config, &diagnostics)?;
     println!("Selected backend: {}", backend.label());
-    model::print_catalog();
-    let artifact = if config.no_download {
+    if config.model_path.is_none() {
+        model::print_catalog();
+    }
+    let artifact = if let Some(path) = config.model_path.as_deref() {
+        let artifact = model::external_model(path)?;
+        println!("Using external GGUF: {}", artifact.first_shard.display());
+        artifact
+    } else if config.no_download {
         model::cached_model(config)?
     } else {
         if !config.yes && !model_exists(config) {
