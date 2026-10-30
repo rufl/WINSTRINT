@@ -1,5 +1,6 @@
 use std::ffi::{OsStr, OsString};
 use std::fs::{self, File, OpenOptions};
+#[cfg(windows)]
 use std::io;
 use std::path::{Component, Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -7,11 +8,16 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
+#[cfg(not(windows))]
+use flate2::read::GzDecoder;
 use reqwest::blocking::Client;
 use serde_json::json;
+#[cfg(not(windows))]
+use tar::Archive;
+#[cfg(windows)]
 use zip::ZipArchive;
 
-use crate::config::{AppConfig, BackendPreference, DecodeProfile};
+use crate::config::{AppConfig, BackendPreference, DecodeProfile, ToggleMode};
 use crate::diagnostics::{self, Diagnostics, GpuKind};
 use crate::model::{self, ModelArtifact};
 use crate::strata;
@@ -124,13 +130,55 @@ fn spawn_runtime(mut command: Command, description: &str) -> Result<(Child, Proc
 }
 
 const LLAMA_TAG: &str = "b11669";
+
+#[cfg(windows)]
 const LLAMA_SYCL_URL: &str = "https://github.com/ggml-org/llama.cpp/releases/download/b11669/llama-b11669-bin-win-sycl-x64.zip";
+#[cfg(windows)]
 const LLAMA_SYCL_SIZE: u64 = 149_038_704;
+#[cfg(windows)]
 const LLAMA_SYCL_SHA256: &str = "a6fa46b20c5161ad71e5b8ec4a52f2dcf713573ce25cefde86aeff4ff0e56cf1";
+#[cfg(not(windows))]
+const LLAMA_SYCL_URL: &str = "https://github.com/ggml-org/llama.cpp/releases/download/b11669/llama-b11669-bin-ubuntu-sycl-fp16-x64.tar.gz";
+#[cfg(not(windows))]
+const LLAMA_SYCL_SIZE: u64 = 54_548_988;
+#[cfg(not(windows))]
+const LLAMA_SYCL_SHA256: &str = "d139fc5a236ffba7de799607ede79f68942620a88f18dd16d90596b7f9a08b4a";
+
+#[cfg(windows)]
 const LLAMA_VULKAN_URL: &str = "https://github.com/ggml-org/llama.cpp/releases/download/b11669/llama-b11669-bin-win-vulkan-x64.zip";
+#[cfg(windows)]
 const LLAMA_VULKAN_SIZE: u64 = 32_182_350;
+#[cfg(windows)]
 const LLAMA_VULKAN_SHA256: &str =
     "2c07574e7bde71321cb785282b20cc821e951132149eeceeea32ddebdbf0598e";
+#[cfg(not(windows))]
+const LLAMA_VULKAN_URL: &str = "https://github.com/ggml-org/llama.cpp/releases/download/b11669/llama-b11669-bin-ubuntu-vulkan-x64.tar.gz";
+#[cfg(not(windows))]
+const LLAMA_VULKAN_SIZE: u64 = 30_497_889;
+#[cfg(not(windows))]
+const LLAMA_VULKAN_SHA256: &str =
+    "e8709e5ba6c1b093dea7f3de57f4aba842f9a188fba6b465782d65d6fcfa4d9f";
+
+#[derive(Clone, Copy)]
+enum BundleArchive {
+    #[cfg(windows)]
+    Zip,
+    #[cfg(not(windows))]
+    TarGz,
+}
+
+#[cfg(windows)]
+const LLAMA_ARCHIVE: BundleArchive = BundleArchive::Zip;
+#[cfg(not(windows))]
+const LLAMA_ARCHIVE: BundleArchive = BundleArchive::TarGz;
+#[cfg(windows)]
+const LLAMA_ARCHIVE_EXTENSION: &str = "zip";
+#[cfg(not(windows))]
+const LLAMA_ARCHIVE_EXTENSION: &str = "tar.gz";
+#[cfg(windows)]
+const LLAMA_EXECUTABLE: &str = "llama-server.exe";
+#[cfg(not(windows))]
+const LLAMA_EXECUTABLE: &str = "llama-server";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ResolvedBackend {
@@ -180,6 +228,16 @@ impl LlamaLaunch {
 
 pub fn select_backend(config: &AppConfig, diagnostics: &Diagnostics) -> Result<ResolvedBackend> {
     let target = diagnostics::target_gpu(diagnostics);
+    if config.speedup {
+        match config.backend {
+            BackendPreference::Auto | BackendPreference::Strata => {
+                return strata_backend(config, target);
+            }
+            _ => anyhow::bail!(
+                "--speedup requires --backend auto or strata; the llama.cpp backends do not support Strata's expert streaming path"
+            ),
+        }
+    }
     match config.backend {
         BackendPreference::Cpu => Ok(ResolvedBackend::Cpu),
         BackendPreference::Sycl => {
@@ -300,7 +358,7 @@ pub fn ensure_llama_bundle(config: &AppConfig, backend: ResolvedBackend) -> Resu
     let directory = config
         .runtime_dir
         .join(format!("llama-{LLAMA_TAG}-{suffix}"));
-    let executable = find_named_file(&directory, "llama-server.exe");
+    let executable = find_named_file(&directory, LLAMA_EXECUTABLE);
     let ready = executable.is_some()
         && fs::read_to_string(directory.join("bundle.json"))
             .ok()
@@ -313,17 +371,20 @@ pub fn ensure_llama_bundle(config: &AppConfig, backend: ResolvedBackend) -> Resu
             })
             .is_some_and(|value| value.eq_ignore_ascii_case(sha));
     if ready {
-        return Ok(executable.expect("ready implies executable"));
+        let executable = executable.expect("ready implies executable");
+        make_executable(&executable)?;
+        return Ok(executable);
     }
     fs::create_dir_all(&directory)?;
-    let archive = config
-        .runtime_dir
-        .join(format!("llama-{LLAMA_TAG}-{suffix}.zip"));
+    let archive = config.runtime_dir.join(format!(
+        "llama-{LLAMA_TAG}-{suffix}.{LLAMA_ARCHIVE_EXTENSION}"
+    ));
     let client = Client::builder().user_agent("WINSTRINT/0.1").build()?;
     model::download_verified(&client, url, &archive, size, Some(sha))?;
-    extract_zip(&archive, &directory)?;
-    let executable = find_named_file(&directory, "llama-server.exe")
-        .context("llama.cpp archive did not contain llama-server.exe")?;
+    extract_archive(&archive, &directory, LLAMA_ARCHIVE)?;
+    let executable = find_named_file(&directory, LLAMA_EXECUTABLE)
+        .with_context(|| format!("llama.cpp archive did not contain {LLAMA_EXECUTABLE}"))?;
+    make_executable(&executable)?;
     fs::write(
         directory.join("bundle.json"),
         serde_json::to_vec_pretty(
@@ -409,6 +470,7 @@ fn start_llama_process(
         .create(true)
         .append(true)
         .open(log_path)?;
+    let tuning = &config.runtime_tuning;
     let mut args = vec![
         OsString::from("--model"),
         artifact.first_shard.clone().into_os_string(),
@@ -424,18 +486,24 @@ fn start_llama_process(
     match launch {
         LlamaLaunch::Gpu(backend) => match backend {
             ResolvedBackend::LlamaSycl => {
-                let (generation_threads, batch_threads) = sycl_thread_counts(diagnostics);
-                let (batch_size, ubatch_size) = sycl_batch_sizes(diagnostics);
+                let (default_generation_threads, default_batch_threads) =
+                    sycl_thread_counts(diagnostics);
+                let (default_batch_size, default_ubatch_size) = sycl_batch_sizes(diagnostics);
+                let generation_threads = tuning.threads.unwrap_or(default_generation_threads);
+                let batch_threads = tuning.threads_batch.unwrap_or(default_batch_threads);
+                let batch_size = tuning.batch_size.unwrap_or(default_batch_size);
+                let ubatch_size = tuning.ubatch_size.unwrap_or(default_ubatch_size);
                 let discrete_a770 = sycl_has_discrete_a770(diagnostics);
-                let gpu_layers = if discrete_a770 {
+                let default_gpu_layers = if discrete_a770 {
                     // The A770 can hold the dense layers of this MoE model.
                     // Keeping only one layer on the device leaves every other
                     // dense operation on the CPU and makes the eGPU mostly
                     // pay Thunderbolt transfer overhead.
-                    "99"
+                    99
                 } else {
-                    "1"
+                    1
                 };
+                let gpu_layers = tuning.gpu_layers.unwrap_or(default_gpu_layers);
                 args.extend(["--threads"].into_iter().map(OsString::from));
                 args.push(generation_threads.to_string().into());
                 args.extend(["--threads-batch"].into_iter().map(OsString::from));
@@ -444,17 +512,14 @@ fn start_llama_process(
                 args.push(batch_size.to_string().into());
                 args.extend(["--ubatch-size"].into_iter().map(OsString::from));
                 args.push(ubatch_size.to_string().into());
+                args.extend(["--n-gpu-layers"].into_iter().map(OsString::from));
+                args.push(gpu_layers.to_string().into());
                 args.extend(
-                    [
-                        "--n-gpu-layers",
-                        gpu_layers,
-                        "--cpu-moe",
-                        "--device",
-                        "SYCL0",
-                    ]
-                    .into_iter()
-                    .map(OsString::from),
+                    ["--cpu-moe", "--device", "SYCL0"]
+                        .into_iter()
+                        .map(OsString::from),
                 );
+                append_flash_attention(&mut args, tuning.flash_attn);
                 let profile = if matches!(profile, DecodeProfile::Auto) {
                     if discrete_a770 {
                         DecodeProfile::Q8Kv
@@ -465,11 +530,9 @@ fn start_llama_process(
                     profile
                 };
                 match profile {
-                    DecodeProfile::NoKv => args.extend(
-                        ["--no-kv-offload", "--no-op-offload"]
-                            .into_iter()
-                            .map(OsString::from),
-                    ),
+                    DecodeProfile::NoKv => {
+                        args.push("--no-kv-offload".into());
+                    }
                     DecodeProfile::Q8Kv => args.extend(
                         ["--cache-type-k", "q8_0", "--cache-type-v", "q8_0"]
                             .into_iter()
@@ -486,7 +549,6 @@ fn start_llama_process(
                                 .into_iter()
                                 .map(OsString::from),
                         );
-                        args.extend(["--no-op-offload"].into_iter().map(OsString::from));
                     }
                     DecodeProfile::Q8Ngram => {
                         args.extend(
@@ -502,14 +564,47 @@ fn start_llama_process(
                     }
                     DecodeProfile::Auto => unreachable!("auto profile is resolved above"),
                 }
+                append_op_offload(
+                    &mut args,
+                    tuning.op_offload,
+                    matches!(profile, DecodeProfile::NoKv | DecodeProfile::Q8NoOp),
+                );
                 args.extend(["--moe-cache-mib", "0"].into_iter().map(OsString::from));
             }
             ResolvedBackend::LlamaVulkan => {
-                args.extend(
-                    ["--n-gpu-layers", "auto", "--fit", "on"]
-                        .into_iter()
-                        .map(OsString::from),
-                );
+                if let Some(value) = tuning.threads {
+                    args.extend(["--threads"].into_iter().map(OsString::from));
+                    args.push(value.to_string().into());
+                }
+                if let Some(value) = tuning.threads_batch {
+                    args.extend(["--threads-batch"].into_iter().map(OsString::from));
+                    args.push(value.to_string().into());
+                }
+                if let Some(value) = tuning.batch_size {
+                    args.extend(["--batch-size"].into_iter().map(OsString::from));
+                    args.push(value.to_string().into());
+                }
+                if let Some(value) = tuning.ubatch_size {
+                    args.extend(["--ubatch-size"].into_iter().map(OsString::from));
+                    args.push(value.to_string().into());
+                }
+                let gpu_layers = tuning.gpu_layers.unwrap_or(usize::MAX);
+                args.extend(["--n-gpu-layers"].into_iter().map(OsString::from));
+                if gpu_layers == usize::MAX {
+                    args.push("auto".into());
+                } else {
+                    args.push(gpu_layers.to_string().into());
+                }
+                args.push("--fit".into());
+                args.push("on".into());
+                if tuning.cpu_moe {
+                    args.push("--cpu-moe".into());
+                }
+                if tuning.no_host {
+                    args.push("--no-host".into());
+                }
+                append_flash_attention(&mut args, tuning.flash_attn);
+                append_op_offload(&mut args, tuning.op_offload, false);
                 if artifact.supports_moe_cache {
                     args.extend(["--moe-cache-mib"].into_iter().map(OsString::from));
                     args.push(recommended_cache_mib(diagnostics).to_string().into());
@@ -519,11 +614,21 @@ fn start_llama_process(
             ResolvedBackend::Cpu | ResolvedBackend::Strata => unreachable!(),
         },
         LlamaLaunch::Cpu => {
-            let (generation_threads, batch_threads) = cpu_thread_counts();
+            let (default_generation_threads, default_batch_threads) = cpu_thread_counts();
+            let generation_threads = tuning.threads.unwrap_or(default_generation_threads);
+            let batch_threads = tuning.threads_batch.unwrap_or(default_batch_threads);
             args.extend(["--threads"].into_iter().map(OsString::from));
             args.push(generation_threads.to_string().into());
             args.extend(["--threads-batch"].into_iter().map(OsString::from));
             args.push(batch_threads.to_string().into());
+            if let Some(value) = tuning.batch_size {
+                args.extend(["--batch-size"].into_iter().map(OsString::from));
+                args.push(value.to_string().into());
+            }
+            if let Some(value) = tuning.ubatch_size {
+                args.extend(["--ubatch-size"].into_iter().map(OsString::from));
+                args.push(value.to_string().into());
+            }
             args.extend(
                 [
                     "--n-gpu-layers",
@@ -541,12 +646,32 @@ fn start_llama_process(
         }
     }
     let mut command = if matches!(launch, LlamaLaunch::Gpu(ResolvedBackend::LlamaSycl)) {
-        let setvars = diagnostics::oneapi_setvars()
-            .context("Intel oneAPI setvars.bat is missing; cannot start SYCL")?;
-        let script = write_sycl_runtime_script(log_path, &setvars, executable, &args)?;
-        let mut command = Command::new("cmd.exe");
-        command.args(["/D", "/S", "/C", "call"]).arg(script);
-        command
+        #[cfg(windows)]
+        {
+            let setvars = diagnostics::oneapi_setvars()
+                .context("Intel oneAPI setvars.bat is missing; cannot start SYCL")?;
+            let script = write_sycl_runtime_script(log_path, &setvars, executable, &args)?;
+            let mut command = Command::new("cmd.exe");
+            command.args(["/D", "/S", "/C", "call"]).arg(script);
+            command
+        }
+        #[cfg(not(windows))]
+        {
+            if let Some(setvars) = diagnostics::oneapi_setvars() {
+                let script = write_sycl_runtime_script(log_path, &setvars, executable, &args)?;
+                let mut command = Command::new("sh");
+                command.arg(script);
+                command
+            } else {
+                let mut command = Command::new(executable);
+                command
+                    .args(&args)
+                    .env("ONEAPI_DEVICE_SELECTOR", "level_zero:0")
+                    .env("SYCL_CACHE_PERSISTENT", "0")
+                    .env("UR_L0_ENABLE_RELAXED_ALLOCATION_LIMITS", "1");
+                command
+            }
+        }
     } else {
         let mut command = Command::new(executable);
         command.args(&args);
@@ -574,24 +699,61 @@ fn start_llama_process(
     })
 }
 
+fn append_flash_attention(args: &mut Vec<OsString>, mode: ToggleMode) {
+    args.push("--flash-attn".into());
+    args.push(mode.label().into());
+}
+
+fn append_op_offload(args: &mut Vec<OsString>, mode: ToggleMode, default_disabled: bool) {
+    match mode {
+        ToggleMode::Auto if default_disabled => args.push("--no-op-offload".into()),
+        ToggleMode::Auto => {}
+        ToggleMode::On => args.push("--op-offload".into()),
+        ToggleMode::Off => args.push("--no-op-offload".into()),
+    }
+}
+
 fn write_sycl_runtime_script(
     log_path: &Path,
     setvars: &Path,
     executable: &Path,
     args: &[OsString],
 ) -> Result<PathBuf> {
-    let script = log_path.with_file_name("llama-sycl-runtime.cmd");
+    let extension = if cfg!(windows) { "cmd" } else { "sh" };
+    let script = log_path.with_file_name(format!("llama-sycl-runtime.{extension}"));
+    #[cfg(windows)]
     let mut content = format!(
         "@echo off\r\nsetlocal\r\ncall {} intel64 vs2022\r\nif errorlevel 1 exit /b %errorlevel%\r\nset \"ONEAPI_DEVICE_SELECTOR=level_zero:0\"\r\nset \"SYCL_CACHE_PERSISTENT=0\"\r\nset \"UR_L0_ENABLE_RELAXED_ALLOCATION_LIMITS=1\"\r\n{}",
         cmd_quote(setvars.as_os_str()),
         cmd_quote(executable.as_os_str())
     );
+    #[cfg(not(windows))]
+    let mut content = format!(
+        "#!/bin/sh\nset -eu\n. {}\nexport ONEAPI_DEVICE_SELECTOR=level_zero:0\nexport SYCL_CACHE_PERSISTENT=0\nexport UR_L0_ENABLE_RELAXED_ALLOCATION_LIMITS=1\nexec {}",
+        shell_quote(setvars.as_os_str()),
+        shell_quote(executable.as_os_str())
+    );
     for arg in args {
         content.push(' ');
-        content.push_str(&cmd_quote(arg));
+        if cfg!(windows) {
+            content.push_str(&cmd_quote(arg));
+        } else {
+            content.push_str(&shell_quote(arg));
+        }
     }
-    content.push_str("\r\nexit /b %errorlevel%\r\n");
+    if cfg!(windows) {
+        content.push_str("\r\nexit /b %errorlevel%\r\n");
+    } else {
+        content.push('\n');
+    }
     fs::write(&script, content)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut permissions = fs::metadata(&script)?.permissions();
+        permissions.set_mode(0o700);
+        fs::set_permissions(&script, permissions)?;
+    }
     Ok(script)
 }
 
@@ -629,21 +791,24 @@ fn sycl_thread_counts(diagnostics: &Diagnostics) -> (usize, usize) {
 }
 
 fn sycl_batch_sizes(diagnostics: &Diagnostics) -> (usize, usize) {
-    if matches!(
-        diagnostics::target_gpu(diagnostics).map(|gpu| gpu.kind),
-        Some(GpuKind::Arc140T | GpuKind::A770)
-    ) {
-        // Larger prompt batches reduce repeated host-to-device expert trips on
-        // Arc GPUs; keep the tested values for both integrated and discrete
-        // adapters.
-        (8192, 4096)
-    } else {
-        (64, 64)
+    match diagnostics::target_gpu(diagnostics).map(|gpu| gpu.kind) {
+        Some(GpuKind::Arc140T) => {
+            // Arc 140T benefits from a smaller physical graph: it reduces
+            // shared-memory pressure while preserving the same model and KV
+            // precision. Keep the logical prompt batch large.
+            (8192, 2048)
+        }
+        Some(GpuKind::A770) => (8192, 4096),
+        _ => (64, 64),
     }
 }
 
 fn cmd_quote(value: &OsStr) -> String {
     format!("\"{}\"", value.to_string_lossy().replace('"', "\"\""))
+}
+
+fn shell_quote(value: &OsStr) -> String {
+    format!("'{}'", value.to_string_lossy().replace('\'', "'\\''"))
 }
 
 fn start_strata(
@@ -753,6 +918,28 @@ fn recommended_cache_mib(diagnostics: &Diagnostics) -> u64 {
     }
 }
 
+fn extract_archive(archive: &Path, destination: &Path, format: BundleArchive) -> Result<()> {
+    match format {
+        #[cfg(windows)]
+        BundleArchive::Zip => extract_zip(archive, destination),
+        #[cfg(not(windows))]
+        BundleArchive::TarGz => extract_tar_gz(archive, destination),
+    }
+}
+
+fn validate_archive_path(relative: &Path) -> Result<()> {
+    if relative.components().any(|component| {
+        matches!(
+            component,
+            Component::ParentDir | Component::RootDir | Component::Prefix(_)
+        )
+    }) {
+        anyhow::bail!("archive contains an unsafe path {}", relative.display());
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
 fn extract_zip(archive: &Path, destination: &Path) -> Result<()> {
     let file = File::open(archive).with_context(|| format!("opening {}", archive.display()))?;
     let mut zip = ZipArchive::new(file).context("reading llama.cpp zip")?;
@@ -761,15 +948,8 @@ fn extract_zip(archive: &Path, destination: &Path) -> Result<()> {
         let Some(relative) = entry.enclosed_name() else {
             anyhow::bail!("zip contains an unsafe path at index {index}");
         };
-        if relative.components().any(|component| {
-            matches!(
-                component,
-                Component::ParentDir | Component::RootDir | Component::Prefix(_)
-            )
-        }) {
-            anyhow::bail!("zip contains an unsafe path {}", relative.display());
-        }
-        let output = destination.join(&relative);
+        validate_archive_path(&relative)?;
+        let output = destination.join(relative);
         if entry.is_dir() {
             fs::create_dir_all(&output)?;
             continue;
@@ -779,6 +959,34 @@ fn extract_zip(archive: &Path, destination: &Path) -> Result<()> {
         }
         let mut target = File::create(&output)?;
         io::copy(&mut entry, &mut target)?;
+    }
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn extract_tar_gz(archive: &Path, destination: &Path) -> Result<()> {
+    let file = File::open(archive).with_context(|| format!("opening {}", archive.display()))?;
+    let decoder = GzDecoder::new(file);
+    let mut tar = Archive::new(decoder);
+    for (index, entry) in tar.entries()?.enumerate() {
+        let mut entry = entry.with_context(|| format!("reading tar entry {index}"))?;
+        let relative = entry.path()?.into_owned();
+        validate_archive_path(&relative)?;
+        let output = destination.join(&relative);
+        let entry_type = entry.header().entry_type();
+        if entry_type.is_dir() {
+            fs::create_dir_all(&output)?;
+        } else if entry_type.is_file() {
+            if let Some(parent) = output.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            entry.unpack(&output)?;
+        } else {
+            anyhow::bail!(
+                "tar archive contains unsupported entry {}",
+                relative.display()
+            );
+        }
     }
     Ok(())
 }
@@ -803,4 +1011,54 @@ fn find_named_file(root: &Path, name: &str) -> Option<PathBuf> {
         }
     }
     None
+}
+
+fn make_executable(path: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut permissions = fs::metadata(path)?.permissions();
+        permissions.set_mode(permissions.mode() | 0o111);
+        fs::set_permissions(path, permissions)?;
+    }
+    #[cfg(not(unix))]
+    let _ = path;
+    Ok(())
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::diagnostics::{Activity, Diagnostics, GpuInfo};
+
+    fn diagnostics(kind: GpuKind) -> Diagnostics {
+        Diagnostics {
+            os_version: String::new(),
+            gpus: vec![GpuInfo {
+                name: String::new(),
+                pnp_device_id: String::new(),
+                driver_version: String::new(),
+                adapter_ram_bytes: 0,
+                kind,
+            }],
+            has_vulkan: false,
+            has_sycl: false,
+            vulkaninfo_available: false,
+            sycl_ls_available: false,
+            activity: Activity {
+                utilization_percent: None,
+                known_processes: Vec::new(),
+                observable: false,
+            },
+        }
+    }
+
+    #[test]
+    fn arc140t_uses_reduced_physical_batch_without_changing_a770() {
+        assert_eq!(
+            sycl_batch_sizes(&diagnostics(GpuKind::Arc140T)),
+            (8192, 2048)
+        );
+        assert_eq!(sycl_batch_sizes(&diagnostics(GpuKind::A770)), (8192, 4096));
+        assert_eq!(sycl_batch_sizes(&diagnostics(GpuKind::Unknown)), (64, 64));
+    }
 }

@@ -436,11 +436,11 @@ mod platform {
 
     use anyhow::{Context, Result};
     use windows_sys::Win32::Foundation::{
-        CloseHandle, GetLastError, ERROR_ENVVAR_NOT_FOUND, ERROR_NOT_ALL_ASSIGNED, ERROR_SUCCESS,
+        CloseHandle, ERROR_ENVVAR_NOT_FOUND, ERROR_NOT_ALL_ASSIGNED, ERROR_SUCCESS, GetLastError,
         HANDLE,
     };
     use windows_sys::Win32::Security::{
-        AdjustTokenPrivileges, LookupPrivilegeValueW, LUID_AND_ATTRIBUTES, SE_PRIVILEGE_ENABLED,
+        AdjustTokenPrivileges, LUID_AND_ATTRIBUTES, LookupPrivilegeValueW, SE_PRIVILEGE_ENABLED,
         SE_SYSTEM_ENVIRONMENT_NAME, TOKEN_ADJUST_PRIVILEGES, TOKEN_PRIVILEGES, TOKEN_QUERY,
     };
     use windows_sys::Win32::System::SystemInformation::{FirmwareTypeUefi, GetFirmwareType};
@@ -677,7 +677,7 @@ mod platform {
 
 #[cfg(not(windows))]
 mod platform {
-    use anyhow::{bail, Result};
+    use anyhow::{Result, bail};
 
     pub fn read_state() -> Result<Option<u8>> {
         bail!("the ReBarUEFI helper requires Windows UEFI firmware access")

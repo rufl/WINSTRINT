@@ -4,7 +4,10 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use anyhow::{Context, Result};
-use serde::{Deserialize, Serialize};
+#[cfg(windows)]
+use serde::Deserialize;
+use serde::Serialize;
+#[cfg(windows)]
 use serde_json::Value;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
@@ -42,6 +45,7 @@ pub struct Diagnostics {
     pub activity: Activity,
 }
 
+#[cfg(windows)]
 #[derive(Deserialize)]
 struct VideoController {
     #[serde(rename = "Name")]
@@ -55,12 +59,11 @@ struct VideoController {
 }
 
 pub fn collect() -> Result<Diagnostics> {
-    let os_version = command_text("cmd.exe", &["/C", "ver"]).unwrap_or_else(|_| "unknown".into());
+    let os_version = os_version();
     let gpus = video_controllers();
     let vulkaninfo_available = command_exists("vulkaninfo");
     let sycl_ls_available = command_exists("sycl-ls");
-    let has_vulkan =
-        vulkaninfo_available || Path::new(r"C:\Windows\System32\vulkan-1.dll").exists();
+    let has_vulkan = vulkaninfo_available || env::var_os("VK_ICD_FILENAMES").is_some();
     let has_sycl = sycl_ls_available
         || env::var_os("ONEAPI_ROOT").is_some_and(|path| Path::new(&path).exists())
         || env::var_os("SETVARS_COMPLETED").is_some()
@@ -76,36 +79,288 @@ pub fn collect() -> Result<Diagnostics> {
     })
 }
 
+fn os_version() -> String {
+    if cfg!(windows) {
+        command_text("cmd.exe", &["/C", "ver"]).unwrap_or_else(|_| "unknown".into())
+    } else {
+        command_text("uname", &["-sr"]).unwrap_or_else(|_| "unknown".into())
+    }
+}
+
 pub(crate) fn oneapi_setvars() -> Option<PathBuf> {
     let mut candidates = Vec::new();
+    let script = if cfg!(windows) {
+        "setvars.bat"
+    } else {
+        "setvars.sh"
+    };
     if let Some(root) = env::var_os("ONEAPI_ROOT") {
-        candidates.push(PathBuf::from(root).join("setvars.bat"));
+        candidates.push(PathBuf::from(root).join(script));
     }
+    #[cfg(windows)]
     for variable in ["ProgramFiles(x86)", "ProgramFiles"] {
         if let Some(root) = env::var_os(variable) {
             candidates.push(
                 PathBuf::from(root)
                     .join("Intel")
                     .join("oneAPI")
-                    .join("setvars.bat"),
+                    .join(script),
             );
         }
     }
+    #[cfg(windows)]
     if let Some(root) = env::var_os("USERPROFILE") {
         candidates.push(
             PathBuf::from(root)
                 .join("Intel")
                 .join("oneAPI")
-                .join("setvars.bat"),
+                .join(script),
         );
     }
+    #[cfg(not(windows))]
+    {
+        candidates.push(PathBuf::from("/opt/intel/oneapi").join(script));
+        if let Some(root) = env::var_os("HOME") {
+            candidates.push(
+                PathBuf::from(root)
+                    .join("intel")
+                    .join("oneapi")
+                    .join(script),
+            );
+        }
+    }
     candidates.into_iter().find(|path| path.is_file())
+}
+
+#[cfg(not(windows))]
+fn command_output(program: &str, args: &[&str]) -> Option<String> {
+    let output = Command::new(program).args(args).output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    Some(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+pub fn command_exists(program: &str) -> bool {
+    let path = Path::new(program);
+    if path.is_absolute() || path.components().count() > 1 {
+        return path.is_file();
+    }
+    let Some(search_path) = env::var_os("PATH") else {
+        return false;
+    };
+    for directory in env::split_paths(&search_path) {
+        if directory.join(program).is_file() {
+            return true;
+        }
+        #[cfg(windows)]
+        if let Some(extensions) = env::var_os("PATHEXT") {
+            for extension in extensions.to_string_lossy().split(';') {
+                if directory.join(format!("{program}{extension}")).is_file() {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+#[cfg(windows)]
+fn video_controllers() -> Vec<GpuInfo> {
+    let script = r#"$ErrorActionPreference='SilentlyContinue'; Get-CimInstance Win32_VideoController | Select-Object Name,PNPDeviceID,DriverVersion,AdapterRAM | ConvertTo-Json -Compress"#;
+    let Some(value) = powershell_json(script) else {
+        return Vec::new();
+    };
+    json_array(value)
+        .into_iter()
+        .filter_map(|item| serde_json::from_value::<VideoController>(item).ok())
+        .filter_map(|controller| {
+            let name = controller.name?.trim().to_string();
+            if name.is_empty() {
+                return None;
+            }
+            let pnp = controller.pnp_device_id.unwrap_or_default();
+            let kind = classify_gpu(&name, &pnp);
+            Some(GpuInfo {
+                name: name.clone(),
+                pnp_device_id: pnp.clone(),
+                driver_version: controller
+                    .driver_version
+                    .unwrap_or_else(|| "unknown".into()),
+                adapter_ram_bytes: normalized_memory(
+                    kind,
+                    number_value(controller.adapter_ram.as_ref()),
+                ),
+                kind,
+            })
+        })
+        .collect()
+}
+
+#[cfg(not(windows))]
+fn video_controllers() -> Vec<GpuInfo> {
+    let mut gpus = command_output("vulkaninfo", &["--summary"])
+        .map(|text| parse_vulkan_devices(&text))
+        .unwrap_or_default();
+    if gpus.is_empty() {
+        if let Some(text) = command_output("sycl-ls", &[]) {
+            for line in text.lines().map(str::trim).filter(|line| !line.is_empty()) {
+                let lower = line.to_ascii_lowercase();
+                if lower.contains("intel") && (lower.contains("gpu") || lower.contains("arc")) {
+                    append_gpu(&mut gpus, line, line, "unknown", 0);
+                }
+            }
+        }
+    }
+    gpus
+}
+
+#[cfg(not(windows))]
+fn parse_vulkan_devices(text: &str) -> Vec<GpuInfo> {
+    let mut gpus = Vec::new();
+    let mut name: Option<String> = None;
+    let mut device_id = String::new();
+    let mut driver = String::from("unknown");
+    let mut memory = 0;
+    for line in text.lines() {
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        let key = key.trim();
+        let value = value.trim();
+        if key == "deviceName" {
+            if let Some(previous) = name.take() {
+                let pnp = if device_id.is_empty() {
+                    String::new()
+                } else {
+                    format!("VEN_8086&DEV_{device_id}")
+                };
+                append_gpu(&mut gpus, &previous, &pnp, &driver, memory);
+            }
+            name = Some(value.to_string());
+            device_id.clear();
+            driver.clear();
+            driver.push_str("unknown");
+            memory = 0;
+        } else if name.is_some() {
+            match key {
+                "deviceID" => {
+                    device_id = value.trim_start_matches("0x").to_ascii_uppercase();
+                }
+                "driverName" | "driverInfo" => {
+                    if driver == "unknown" {
+                        driver = value.to_string();
+                    }
+                }
+                "deviceLocalMemory" => {
+                    memory = value.parse().unwrap_or_default();
+                }
+                _ => {}
+            }
+        }
+    }
+    if let Some(last) = name {
+        let pnp = if device_id.is_empty() {
+            String::new()
+        } else {
+            format!("VEN_8086&DEV_{device_id}")
+        };
+        append_gpu(&mut gpus, &last, &pnp, &driver, memory);
+    }
+    gpus
+}
+
+#[cfg(not(windows))]
+fn append_gpu(
+    gpus: &mut Vec<GpuInfo>,
+    name: &str,
+    pnp_device_id: &str,
+    driver_version: &str,
+    adapter_ram_bytes: u64,
+) {
+    let name = name.trim();
+    if name.is_empty() || gpus.iter().any(|gpu| gpu.name.eq_ignore_ascii_case(name)) {
+        return;
+    }
+    let kind = classify_gpu(name, pnp_device_id);
+    gpus.push(GpuInfo {
+        name: name.to_string(),
+        pnp_device_id: pnp_device_id.to_string(),
+        driver_version: driver_version.trim().to_string(),
+        adapter_ram_bytes: normalized_memory(kind, adapter_ram_bytes),
+        kind,
+    });
+}
+
+#[cfg(windows)]
+fn gpu_activity() -> Activity {
+    let utilization_script = r#"$ErrorActionPreference='SilentlyContinue'; try { Get-Counter '\GPU Engine(*)\Utilization Percentage' -ErrorAction Stop | Select-Object -ExpandProperty CounterSamples | ForEach-Object { [PSCustomObject]@{Value=$_.CookedValue} } | ConvertTo-Json -Compress } catch { '{}' }"#;
+    let utilization_percent = powershell_json(utilization_script).and_then(|value| {
+        json_array(value)
+            .into_iter()
+            .filter_map(|item| item.get("Value").and_then(Value::as_f64))
+            .filter(|value| value.is_finite())
+            .reduce(f64::max)
+            .map(|value| value.clamp(0.0, 100.0))
+    });
+    let process_script = r#"$ErrorActionPreference='SilentlyContinue'; Get-Process | Where-Object { $_.ProcessName -match '^(llama-server|llama|strata|ollama|lmstudio|comfy|qwen)' } | Select-Object ProcessName,Id | ConvertTo-Json -Compress"#;
+    let known_processes = powershell_json(process_script)
+        .map(json_array)
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|item| {
+            let name = item.get("ProcessName")?.as_str()?.to_string();
+            let id = item.get("Id").and_then(Value::as_u64).unwrap_or_default();
+            Some(format!("{name} ({id})"))
+        })
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    Activity {
+        utilization_percent,
+        observable: utilization_percent.is_some(),
+        known_processes,
+    }
+}
+
+#[cfg(not(windows))]
+fn gpu_activity() -> Activity {
+    let known_processes = command_output(
+        "pgrep",
+        &[
+            "-af",
+            "llama-server|llama|strata|ollama|lmstudio|comfy|qwen",
+        ],
+    )
+    .map(|text| {
+        text.lines()
+            .filter_map(|line| {
+                let mut fields = line.splitn(2, char::is_whitespace);
+                let pid = fields.next()?.trim();
+                let command = fields.next()?.trim();
+                let executable = command.split_whitespace().next()?;
+                let name = Path::new(executable).file_name()?.to_string_lossy();
+                Some(format!("{name} ({pid})"))
+            })
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect()
+    })
+    .unwrap_or_default();
+    Activity {
+        utilization_percent: None,
+        observable: false,
+        known_processes,
+    }
 }
 
 pub fn print_report(diagnostics: &Diagnostics) {
     println!("OS: {}", diagnostics.os_version.trim());
     if diagnostics.gpus.is_empty() {
-        println!("GPU: no display adapter returned by WMI");
+        if cfg!(windows) {
+            println!("GPU: no display adapter returned by WMI");
+        } else {
+            println!("GPU: no Intel adapter found in Vulkan/SYCL enumeration");
+        }
     } else {
         for (index, gpu) in diagnostics.gpus.iter().enumerate() {
             let memory = if gpu.adapter_ram_bytes == 0 {
@@ -134,11 +389,13 @@ pub fn print_report(diagnostics: &Diagnostics) {
             "Strata: managed native Windows SYCL port requires Intel oneAPI DPC++/C++, Visual Studio Build Tools, and Level Zero; run `winstrint strata-status --verify`."
         );
     } else if diagnostics.has_sycl {
-        println!("Strata: native Intel Arc SYCL prerequisites detected.");
+        println!(
+            "Strata: native integration is Windows-only; llama.cpp SYCL prerequisites detected."
+        );
     } else if diagnostics.has_vulkan {
-        println!("Strata: Intel Arc SYCL prerequisites are unavailable; Vulkan is available.");
+        println!("Strata: native integration is Windows-only; Vulkan is available.");
     } else {
-        println!("Strata: Intel Arc SYCL and Vulkan prerequisites are unavailable.");
+        println!("Strata: native integration is Windows-only; Intel Arc backends are unavailable.");
     }
     match diagnostics.activity.utilization_percent {
         Some(value) => println!("GPU activity: {:.1}%", value),
@@ -198,75 +455,6 @@ pub fn target_gpu(diagnostics: &Diagnostics) -> Option<&GpuInfo> {
         })
 }
 
-pub fn command_exists(program: &str) -> bool {
-    let command = if cfg!(windows) { "where.exe" } else { "which" };
-    Command::new(command)
-        .arg(program)
-        .output()
-        .is_ok_and(|output| output.status.success())
-}
-
-fn video_controllers() -> Vec<GpuInfo> {
-    let script = r#"$ErrorActionPreference='SilentlyContinue'; Get-CimInstance Win32_VideoController | Select-Object Name,PNPDeviceID,DriverVersion,AdapterRAM | ConvertTo-Json -Compress"#;
-    let Some(value) = powershell_json(script) else {
-        return Vec::new();
-    };
-    json_array(value)
-        .into_iter()
-        .filter_map(|item| serde_json::from_value::<VideoController>(item).ok())
-        .filter_map(|controller| {
-            let name = controller.name?.trim().to_string();
-            if name.is_empty() {
-                return None;
-            }
-            let pnp = controller.pnp_device_id.unwrap_or_default();
-            let kind = classify_gpu(&name, &pnp);
-            Some(GpuInfo {
-                name: name.clone(),
-                pnp_device_id: pnp.clone(),
-                driver_version: controller
-                    .driver_version
-                    .unwrap_or_else(|| "unknown".into()),
-                adapter_ram_bytes: normalized_memory(
-                    kind,
-                    number_value(controller.adapter_ram.as_ref()),
-                ),
-                kind,
-            })
-        })
-        .collect()
-}
-
-fn gpu_activity() -> Activity {
-    let utilization_script = r#"$ErrorActionPreference='SilentlyContinue'; try { Get-Counter '\GPU Engine(*)\Utilization Percentage' -ErrorAction Stop | Select-Object -ExpandProperty CounterSamples | ForEach-Object { [PSCustomObject]@{Value=$_.CookedValue} } | ConvertTo-Json -Compress } catch { '{}' }"#;
-    let utilization_percent = powershell_json(utilization_script).and_then(|value| {
-        json_array(value)
-            .into_iter()
-            .filter_map(|item| item.get("Value").and_then(Value::as_f64))
-            .filter(|value| value.is_finite())
-            .reduce(f64::max)
-            .map(|value| value.clamp(0.0, 100.0))
-    });
-    let process_script = r#"$ErrorActionPreference='SilentlyContinue'; Get-Process | Where-Object { $_.ProcessName -match '^(llama-server|llama|strata|ollama|lmstudio|comfy|qwen)' } | Select-Object ProcessName,Id | ConvertTo-Json -Compress"#;
-    let known_processes = powershell_json(process_script)
-        .map(json_array)
-        .unwrap_or_default()
-        .into_iter()
-        .filter_map(|item| {
-            let name = item.get("ProcessName")?.as_str()?.to_string();
-            let id = item.get("Id").and_then(Value::as_u64).unwrap_or_default();
-            Some(format!("{name} ({id})"))
-        })
-        .collect::<BTreeSet<_>>()
-        .into_iter()
-        .collect();
-    Activity {
-        utilization_percent,
-        observable: utilization_percent.is_some(),
-        known_processes,
-    }
-}
-
 fn classify_gpu(name: &str, pnp: &str) -> GpuKind {
     let upper_name = name.to_ascii_uppercase();
     let upper_pnp = pnp.to_ascii_uppercase();
@@ -289,6 +477,7 @@ fn normalized_memory(kind: GpuKind, reported_bytes: u64) -> u64 {
     }
 }
 
+#[cfg(windows)]
 fn powershell_json(script: &str) -> Option<Value> {
     let output = Command::new(powershell_program())
         .args([
@@ -308,6 +497,7 @@ fn powershell_json(script: &str) -> Option<Value> {
     serde_json::from_str(stdout.trim()).ok()
 }
 
+#[cfg(windows)]
 fn powershell_program() -> PathBuf {
     if cfg!(windows) {
         let windir = env::var_os("WINDIR").unwrap_or_else(|| "C:\\Windows".into());
@@ -329,6 +519,7 @@ fn command_text(program: &str, args: &[&str]) -> Result<String> {
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
+#[cfg(windows)]
 fn json_array(value: Value) -> Vec<Value> {
     match value {
         Value::Array(values) => values,
@@ -337,6 +528,7 @@ fn json_array(value: Value) -> Vec<Value> {
     }
 }
 
+#[cfg(windows)]
 fn number_value(value: Option<&Value>) -> u64 {
     match value {
         Some(Value::Number(number)) => number

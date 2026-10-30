@@ -1086,6 +1086,16 @@ fn use_streamed_kv(context: u32, host_ram_gib: Option<f64>) -> bool {
     host_ram_gib.is_some_and(|ram| ram >= kv_gib + 6.0)
 }
 
+fn select_expert_profile(source: &Path, model: &PreparedModel, arc140t: bool) -> PathBuf {
+    if !arc140t {
+        let sycl_profile = source.join("data").join("expert-profile-sycl.bin");
+        if sycl_profile.is_file() {
+            return sycl_profile;
+        }
+    }
+    model.profile.clone()
+}
+
 fn write_server_config(
     config: &AppConfig,
     source: &Path,
@@ -1119,6 +1129,12 @@ fn write_server_config(
             config.context
         );
     }
+    let expert_profile = select_expert_profile(source, model, arc140t);
+    let reasoning_effort = config
+        .reasoning_effort
+        .map(|effort| effort.label())
+        .unwrap_or("high");
+
     let mut environment = Map::new();
     for (key, value) in [
         ("ONEAPI_DEVICE_SELECTOR", "level_zero:0"),
@@ -1142,6 +1158,7 @@ fn write_server_config(
         environment.insert("STRATA_RING_TIMEOUT_S".into(), json!("120"));
         environment.insert("STRATA_VERIFY_NO_HOST".into(), json!("0"));
     }
+    let speculative_window = config.strata_spec.unwrap_or(4);
     let mut args = vec![
         "--pack".to_string(),
         path_string(&model.pack),
@@ -1150,7 +1167,7 @@ fn write_server_config(
         "--ple-gguf".to_string(),
         path_string(&model.ple_shard),
         "--expert-profile".to_string(),
-        path_string(&model.profile),
+        path_string(&expert_profile),
         "--expert-cache".to_string(),
         "auto".to_string(),
         "--vram-reserve-mib".to_string(),
@@ -1158,15 +1175,19 @@ fn write_server_config(
         "--prefill".to_string(),
         prefill.to_string(),
         "--spec".to_string(),
-        "4".to_string(),
+        speculative_window.to_string(),
     ];
     if arc140t {
         args.push("--mmap-experts".to_string());
+    } else {
+        // Stream expert misses through the bounded SYCL staging/mirror path.
+        args.push("--stream-experts".to_string());
     }
-    if !arc140t {
+    if !arc140t || config.strata_mtp {
+        let minimum_probability = config.strata_spec_min_p.unwrap_or(0.5);
         args.extend([
             "--spec-min-p".to_string(),
-            "0.5".to_string(),
+            minimum_probability.to_string(),
             "--mtp".to_string(),
             path_string(&model.mtp_runtime),
         ]);
@@ -1194,7 +1215,7 @@ fn write_server_config(
         "tokenizer": path_string(&model.tokenizer),
         "model_name": config.model.key(),
         "arch": "qwen4exp",
-        "reasoning_effort": "high",
+        "reasoning_effort": reasoning_effort,
         "log": path_string(&log),
         "gpu": 0,
         "env": environment
@@ -1579,6 +1600,12 @@ mod tests {
             port: 8080,
             context: 4096,
             decode_profile: crate::config::DecodeProfile::Auto,
+            runtime_tuning: crate::config::RuntimeTuning::default(),
+            reasoning_effort: None,
+            strata_mtp: false,
+            strata_spec: None,
+            strata_spec_min_p: None,
+            speedup: false,
             force: false,
             no_download: true,
             yes: true,
@@ -1619,6 +1646,7 @@ mod tests {
         assert!(!args.contains(&"--kv-resident"));
         assert!(args.windows(2).any(|pair| pair == ["--prefill", "auto"]));
         assert!(!args.contains(&"--mmap-experts"));
+        assert!(args.contains(&"--stream-experts"));
         let arc_path = write_server_config(
             &config,
             Path::new("source"),
@@ -1645,6 +1673,35 @@ mod tests {
         assert!(arc_args.contains(&"--mmap-experts"));
         assert!(!arc_args.contains(&"--mtp"));
         assert!(arc_args.windows(2).any(|pair| pair == ["--pcie-frac", "0"]));
+        let mut arc_mtp_config = config.clone();
+        arc_mtp_config.strata_mtp = true;
+        arc_mtp_config.strata_spec = Some(3);
+        arc_mtp_config.strata_spec_min_p = Some(0.7);
+        let arc_mtp_path = write_server_config(
+            &arc_mtp_config,
+            Path::new("source"),
+            Path::new("strata.exe"),
+            &model,
+            false,
+            true,
+        )
+        .expect("Arc 140T MTP config generation");
+        let arc_mtp_value: Value =
+            serde_json::from_slice(&fs::read(arc_mtp_path).expect("Arc 140T MTP config"))
+                .expect("valid Arc 140T MTP JSON");
+        let arc_mtp_args = arc_mtp_value["args"]
+            .as_array()
+            .expect("Arc 140T MTP args array")
+            .iter()
+            .map(|item| item.as_str().expect("Arc 140T MTP string arg"))
+            .collect::<Vec<_>>();
+        assert!(arc_mtp_args.windows(2).any(|pair| pair == ["--spec", "3"]));
+        assert!(
+            arc_mtp_args
+                .windows(2)
+                .any(|pair| pair == ["--spec-min-p", "0.7"])
+        );
+        assert!(arc_mtp_args.contains(&"--mtp"));
         let _ = fs::remove_dir_all(root);
     }
     #[test]

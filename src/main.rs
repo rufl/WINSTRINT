@@ -162,7 +162,11 @@ fn start_chat(config: &config::AppConfig) -> Result<()> {
     let fresh = diagnostics::collect()?;
     diagnostics::require_idle(&fresh, config.force, false)?;
     let process = runtime::start(config, &fresh, backend, &artifact)?;
-    let result = tui::run(&process.endpoint, "winstrint");
+    let result = tui::run(
+        &process.endpoint,
+        "winstrint",
+        config.reasoning_effort.map(|effort| effort.label()),
+    );
     drop(process);
     drop(gpu_lease);
     result

@@ -35,6 +35,8 @@ struct ProfileResult {
     generated_tokens: Option<usize>,
     prompt_tokens_per_second: Option<f64>,
     decode_tokens_per_second: Option<f64>,
+    prompt_tokens_per_second_samples: Vec<f64>,
+    decode_tokens_per_second_samples: Vec<f64>,
     elapsed_ms: Option<u128>,
     error: Option<String>,
 }
@@ -47,6 +49,8 @@ struct TuneReport {
     prompt_bytes: usize,
     context: u32,
     max_tokens: u32,
+    repeats: u32,
+    warmup: u32,
     profiles: Vec<ProfileResult>,
     recommendation: Option<String>,
 }
@@ -58,28 +62,35 @@ pub fn run(config: &AppConfig, args: &DecodeTuneArgs) -> Result<()> {
     if args.timeout_secs == 0 {
         anyhow::bail!("--timeout-secs must be greater than zero");
     }
+    if args.repeats == 0 {
+        anyhow::bail!("--repeats must be greater than zero");
+    }
     let prompt = fs::read_to_string(&args.prompt_file)
         .with_context(|| format!("reading prompt file {}", args.prompt_file.display()))?;
     if prompt.trim().is_empty() {
         anyhow::bail!("prompt file {} is empty", args.prompt_file.display());
     }
-    let profiles = selected_profiles(args)?;
-
     config.ensure_dirs()?;
     let diagnostics = diagnostics::collect()?;
     diagnostics::print_report(&diagnostics);
     let backend = runtime::select_backend(config, &diagnostics)?;
-    if !matches!(backend, ResolvedBackend::LlamaSycl) {
-        anyhow::bail!(
-            "tune-decode currently requires llama.cpp SYCL; selected {}. Use --backend sycl on the A770.",
-            backend.label()
-        );
+    let profiles = selected_profiles(args)?;
+    if matches!(backend, ResolvedBackend::Strata)
+        && profiles
+            .iter()
+            .any(|profile| !matches!(profile, DecodeProfile::Auto))
+    {
+        anyhow::bail!("Strata supports only the auto decode profile");
     }
     println!("Selected backend: {}", backend.label());
     println!("ReBAR is not required; this tool compares software KV and offload profiles.");
 
     let artifact = if let Some(path) = config.model_path.as_deref() {
         model::external_model(path)?
+    } else if matches!(backend, ResolvedBackend::Strata) {
+        model::cached_model(config).context(
+            "tune-decode does not download model weights; run `winstrint download` first",
+        )?
     } else {
         model::cached_model(config).context(
             "tune-decode does not download model weights; run `winstrint download` first or pass --model-path",
@@ -89,12 +100,18 @@ pub fn run(config: &AppConfig, args: &DecodeTuneArgs) -> Result<()> {
     let _lease = queue.acquire("decode-tune", true)?;
     let fresh = diagnostics::collect()?;
     diagnostics::require_idle(&fresh, config.force, true)?;
-    runtime::ensure_llama_bundle(config, backend)?;
+    if !matches!(backend, ResolvedBackend::Strata) {
+        runtime::ensure_llama_bundle(config, backend)?;
+    }
 
     let client = Client::builder()
         .timeout(Duration::from_secs(args.timeout_secs))
         .build()
         .context("creating benchmark HTTP client")?;
+    let reasoning_effort = config
+        .reasoning_effort
+        .map(|effort| effort.label())
+        .unwrap_or("low");
     let mut results = Vec::with_capacity(profiles.len());
     for (index, profile) in profiles.into_iter().enumerate() {
         let port = benchmark_port(config.port, index)?;
@@ -113,15 +130,19 @@ pub fn run(config: &AppConfig, args: &DecodeTuneArgs) -> Result<()> {
             &client,
             &prompt,
             args.max_tokens,
+            reasoning_effort,
+            args.repeats,
+            args.warmup,
             profile,
             port,
         ) {
             Ok(result) => {
                 println!(
-                    "  prompt {:.2} tok/s | decode {:.2} tok/s | {} generated",
+                    "  prompt {:.2} tok/s | decode {:.2} tok/s | {} generated | median of {} runs",
                     result.prompt_tokens_per_second.unwrap_or_default(),
                     result.decode_tokens_per_second.unwrap_or_default(),
-                    result.generated_tokens.unwrap_or_default()
+                    result.generated_tokens.unwrap_or_default(),
+                    result.decode_tokens_per_second_samples.len()
                 );
                 results.push(result);
             }
@@ -134,6 +155,8 @@ pub fn run(config: &AppConfig, args: &DecodeTuneArgs) -> Result<()> {
                     generated_tokens: None,
                     prompt_tokens_per_second: None,
                     decode_tokens_per_second: None,
+                    prompt_tokens_per_second_samples: Vec::new(),
+                    decode_tokens_per_second_samples: Vec::new(),
                     elapsed_ms: None,
                     error: Some(format!("{error:#}")),
                 });
@@ -149,6 +172,8 @@ pub fn run(config: &AppConfig, args: &DecodeTuneArgs) -> Result<()> {
         prompt_bytes: prompt.len(),
         context: config.context,
         max_tokens: args.max_tokens,
+        repeats: args.repeats,
+        warmup: args.warmup,
         profiles: results,
         recommendation: recommendation.clone(),
     };
@@ -200,6 +225,9 @@ fn benchmark_profile(
     client: &Client,
     prompt: &str,
     max_tokens: u32,
+    reasoning_effort: &str,
+    repeats: u32,
+    warmup: u32,
     profile: DecodeProfile,
     port: u16,
 ) -> Result<ProfileResult> {
@@ -209,16 +237,75 @@ fn benchmark_profile(
     let process =
         runtime::start_with_profile(&benchmark_config, diagnostics, backend, artifact, profile)?;
     let endpoint = process.endpoint.clone();
+    for _ in 0..warmup {
+        let _ = benchmark_request(
+            client,
+            &endpoint,
+            config.model.key(),
+            prompt,
+            max_tokens,
+            reasoning_effort,
+        )?;
+    }
+
+    let mut prompt_samples = Vec::with_capacity(repeats as usize);
+    let mut decode_samples = Vec::with_capacity(repeats as usize);
+    let mut elapsed_samples = Vec::with_capacity(repeats as usize);
+    let mut last_timings = None;
+    for _ in 0..repeats {
+        let (timings, elapsed_ms) = benchmark_request(
+            client,
+            &endpoint,
+            config.model.key(),
+            prompt,
+            max_tokens,
+            reasoning_effort,
+        )?;
+        prompt_samples.push(timings.prompt_per_second);
+        decode_samples.push(timings.predicted_per_second);
+        elapsed_samples.push(elapsed_ms);
+        last_timings = Some(timings);
+    }
+    let timings = last_timings.context("benchmark produced no measured timings")?;
+    let prompt_per_second = median(&prompt_samples)
+        .context("benchmark produced no finite prompt throughput samples")?;
+    let decode_per_second = median(&decode_samples)
+        .context("benchmark produced no finite decode throughput samples")?;
+    let elapsed_ms =
+        median_u128(&elapsed_samples).context("benchmark produced no elapsed samples")?;
+    drop(process);
+    Ok(ProfileResult {
+        profile: profile.label().to_owned(),
+        success: true,
+        prompt_tokens: Some(timings.prompt_n),
+        generated_tokens: Some(timings.predicted_n),
+        prompt_tokens_per_second: Some(prompt_per_second),
+        decode_tokens_per_second: Some(decode_per_second),
+        prompt_tokens_per_second_samples: prompt_samples,
+        decode_tokens_per_second_samples: decode_samples,
+        elapsed_ms: Some(elapsed_ms),
+        error: None,
+    })
+}
+
+fn benchmark_request(
+    client: &Client,
+    endpoint: &str,
+    model: &str,
+    prompt: &str,
+    max_tokens: u32,
+    reasoning_effort: &str,
+) -> Result<(ServerTimings, u128)> {
     let started = Instant::now();
     let response = client
         .post(format!("{endpoint}/v1/chat/completions"))
         .json(&json!({
-            "model": config.model.key(),
+            "model": model,
             "messages": [{"role": "user", "content": prompt}],
             "stream": false,
             "max_tokens": max_tokens,
             "temperature": 0,
-            "reasoning_effort": "low"
+            "reasoning_effort": reasoning_effort
         }))
         .send()
         .context("sending decode benchmark request")?;
@@ -231,21 +318,33 @@ fn benchmark_profile(
         anyhow::bail!("runtime returned {status}: {body}");
     }
     let parsed: ServerResponse = serde_json::from_value(body)
-        .context("decode benchmark response did not contain llama.cpp timings")?;
+        .context("decode benchmark response did not contain timings")?;
     let timings = parsed
         .timings
         .context("decode benchmark response omitted timings")?;
-    drop(process);
-    Ok(ProfileResult {
-        profile: profile.label().to_owned(),
-        success: true,
-        prompt_tokens: Some(timings.prompt_n),
-        generated_tokens: Some(timings.predicted_n),
-        prompt_tokens_per_second: Some(timings.prompt_per_second),
-        decode_tokens_per_second: Some(timings.predicted_per_second),
-        elapsed_ms: Some(elapsed_ms),
-        error: None,
-    })
+    Ok((timings, elapsed_ms))
+}
+
+fn median(values: &[f64]) -> Option<f64> {
+    let mut finite = values
+        .iter()
+        .copied()
+        .filter(|value| value.is_finite())
+        .collect::<Vec<_>>();
+    if finite.is_empty() {
+        return None;
+    }
+    finite.sort_by(f64::total_cmp);
+    Some(finite[finite.len() / 2])
+}
+
+fn median_u128(values: &[u128]) -> Option<u128> {
+    if values.is_empty() {
+        return None;
+    }
+    let mut sorted = values.to_vec();
+    sorted.sort_unstable();
+    Some(sorted[sorted.len() / 2])
 }
 
 fn best_profile(results: &[ProfileResult]) -> Option<String> {
@@ -322,4 +421,16 @@ fn benchmark_port(base: u16, index: usize) -> Result<u16> {
 
 fn port_available(port: u16) -> bool {
     TcpListener::bind(("127.0.0.1", port)).is_ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn median_ignores_non_finite_samples_and_sorts() {
+        assert_eq!(median(&[f64::NAN, 9.0, 1.0, 5.0]), Some(5.0));
+        assert_eq!(median(&[f64::INFINITY]), None);
+        assert_eq!(median_u128(&[9, 1, 5, 3]), Some(5));
+    }
 }

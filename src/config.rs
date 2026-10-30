@@ -1,7 +1,7 @@
 use std::env;
 use std::path::PathBuf;
 
-use anyhow::Result;
+use anyhow::{Result, bail};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
@@ -11,6 +11,41 @@ pub enum BackendPreference {
     Sycl,
     Vulkan,
     Strata,
+}
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+pub enum ToggleMode {
+    Auto,
+    On,
+    Off,
+}
+
+impl ToggleMode {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::On => "on",
+            Self::Off => "off",
+        }
+    }
+}
+
+impl Default for ToggleMode {
+    fn default() -> Self {
+        Self::Auto
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct RuntimeTuning {
+    pub flash_attn: ToggleMode,
+    pub op_offload: ToggleMode,
+    pub threads: Option<usize>,
+    pub threads_batch: Option<usize>,
+    pub batch_size: Option<usize>,
+    pub ubatch_size: Option<usize>,
+    pub gpu_layers: Option<usize>,
+    pub cpu_moe: bool,
+    pub no_host: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
@@ -58,6 +93,26 @@ impl DecodeProfile {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+pub enum ReasoningEffort {
+    #[value(name = "none", alias = "off")]
+    None,
+    Low,
+    Medium,
+    High,
+}
+
+impl ReasoningEffort {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+        }
+    }
+}
+
 #[derive(Args, Debug)]
 pub struct DecodeTuneArgs {
     #[arg(long, value_name = "PATH", required = true)]
@@ -70,6 +125,10 @@ pub struct DecodeTuneArgs {
     pub max_tokens: u32,
     #[arg(long, default_value_t = 3600)]
     pub timeout_secs: u64,
+    #[arg(long, default_value_t = 1, value_name = "N")]
+    pub repeats: u32,
+    #[arg(long, default_value_t = 1, value_name = "N")]
+    pub warmup: u32,
     #[arg(long, value_name = "PATH")]
     pub output: Option<PathBuf>,
     #[arg(long)]
@@ -197,6 +256,62 @@ pub struct CommonArgs {
         help = "llama.cpp decode profile; auto uses q8 KV on a discrete A770"
     )]
     pub decode_profile: DecodeProfile,
+    #[arg(
+        long,
+        value_enum,
+        default_value = "auto",
+        help = "Flash Attention mode for llama.cpp"
+    )]
+    pub flash_attn: ToggleMode,
+    #[arg(
+        long,
+        value_enum,
+        default_value = "auto",
+        help = "Host operation offload mode for llama.cpp"
+    )]
+    pub op_offload: ToggleMode,
+    #[arg(long, value_name = "N", help = "Override llama.cpp generation threads")]
+    pub threads: Option<usize>,
+    #[arg(long, value_name = "N", help = "Override llama.cpp prompt threads")]
+    pub threads_batch: Option<usize>,
+    #[arg(long, value_name = "N", help = "Override llama.cpp logical batch size")]
+    pub batch_size: Option<usize>,
+    #[arg(
+        long,
+        value_name = "N",
+        help = "Override llama.cpp physical batch size"
+    )]
+    pub ubatch_size: Option<usize>,
+    #[arg(long, value_name = "N", help = "Override llama.cpp GPU layer count")]
+    pub gpu_layers: Option<usize>,
+    #[arg(long, help = "Keep mixture-of-experts weights on the CPU")]
+    pub cpu_moe: bool,
+    #[arg(long, help = "Bypass host buffers for Vulkan memory experiments")]
+    pub no_host: bool,
+    #[arg(
+        long,
+        value_enum,
+        help = "Set the default reasoning budget; none is lowest latency"
+    )]
+    pub reasoning_effort: Option<ReasoningEffort>,
+    #[arg(
+        long,
+        help = "Prefer Strata's direct SSD expert streaming and throughput path"
+    )]
+    pub speedup: bool,
+    #[arg(
+        long,
+        help = "Enable Strata MTP on Arc 140T; disabled by default for safety"
+    )]
+    pub strata_mtp: bool,
+    #[arg(long, value_name = "N", help = "Override Strata speculative window")]
+    pub strata_spec: Option<u32>,
+    #[arg(
+        long,
+        value_name = "P",
+        help = "Override Strata speculative minimum probability"
+    )]
+    pub strata_spec_min_p: Option<f32>,
     #[arg(long)]
     pub force: bool,
     #[arg(long)]
@@ -219,7 +334,7 @@ impl ModelChoice {
 
 #[derive(Subcommand, Debug)]
 pub enum Command {
-    #[command(about = "Inspect Windows, Intel Arc, runtime, and GPU activity")]
+    #[command(about = "Inspect OS, Intel Arc, runtime, and GPU activity")]
     Check,
     #[command(about = "Discover and download the selected Hugging Face model")]
     Download,
@@ -300,6 +415,12 @@ pub struct AppConfig {
     pub port: u16,
     pub context: u32,
     pub decode_profile: DecodeProfile,
+    pub runtime_tuning: RuntimeTuning,
+    pub reasoning_effort: Option<ReasoningEffort>,
+    pub strata_mtp: bool,
+    pub strata_spec: Option<u32>,
+    pub strata_spec_min_p: Option<f32>,
+    pub speedup: bool,
     pub force: bool,
     pub no_download: bool,
     pub yes: bool,
@@ -319,6 +440,35 @@ impl AppConfig {
             .clone()
             .or_else(|| env::var_os("WINSTRINT_A770_QUEUE").map(PathBuf::from))
             .unwrap_or_else(|| data_dir.join("a770-queue.json"));
+        let runtime_tuning = RuntimeTuning {
+            flash_attn: cli.common.flash_attn,
+            op_offload: cli.common.op_offload,
+            threads: cli.common.threads,
+            threads_batch: cli.common.threads_batch,
+            batch_size: cli.common.batch_size,
+            ubatch_size: cli.common.ubatch_size,
+            gpu_layers: cli.common.gpu_layers,
+            cpu_moe: cli.common.cpu_moe,
+            no_host: cli.common.no_host,
+        };
+        for (name, value) in [
+            ("threads", runtime_tuning.threads),
+            ("threads-batch", runtime_tuning.threads_batch),
+            ("batch-size", runtime_tuning.batch_size),
+            ("ubatch-size", runtime_tuning.ubatch_size),
+        ] {
+            if value == Some(0) {
+                bail!("--{name} must be greater than zero");
+            }
+        }
+        if cli.common.strata_spec == Some(0) {
+            bail!("--strata-spec must be greater than zero");
+        }
+        if let Some(value) = cli.common.strata_spec_min_p
+            && (!value.is_finite() || !(0.0..=1.0).contains(&value))
+        {
+            bail!("--strata-spec-min-p must be finite and between 0 and 1");
+        }
         Ok(Self {
             model_dir: data_dir.join("models"),
             runtime_dir: data_dir.join("runtime"),
@@ -330,6 +480,12 @@ impl AppConfig {
             port: cli.common.port,
             context: cli.common.context,
             decode_profile: cli.common.decode_profile,
+            runtime_tuning,
+            reasoning_effort: cli.common.reasoning_effort,
+            strata_mtp: cli.common.strata_mtp,
+            strata_spec: cli.common.strata_spec,
+            strata_spec_min_p: cli.common.strata_spec_min_p,
+            speedup: cli.common.speedup,
             force: cli.common.force,
             no_download: cli.common.no_download,
             yes: cli.common.yes,
@@ -361,4 +517,80 @@ fn parse_rebar_state(value: &str) -> std::result::Result<u8, String> {
         ));
     }
     Ok(parsed)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn speedup_flag_reaches_app_config() {
+        let cli = Cli::try_parse_from([
+            "winstrint",
+            "--speedup",
+            "--reasoning-effort",
+            "none",
+            "--data-dir",
+            "speedup-test",
+            "chat",
+        ])
+        .expect("speedup CLI");
+        let config = AppConfig::from_cli(&cli).expect("app config");
+        assert!(config.speedup);
+        assert_eq!(config.reasoning_effort, Some(ReasoningEffort::None));
+    }
+    #[test]
+    fn runtime_tuning_flags_reach_app_config() {
+        let cli = Cli::try_parse_from([
+            "winstrint",
+            "--flash-attn",
+            "on",
+            "--op-offload",
+            "off",
+            "--threads",
+            "12",
+            "--threads-batch",
+            "16",
+            "--batch-size",
+            "8192",
+            "--ubatch-size",
+            "2048",
+            "--gpu-layers",
+            "1",
+            "--cpu-moe",
+            "--no-host",
+            "--strata-mtp",
+            "--strata-spec",
+            "3",
+            "--strata-spec-min-p",
+            "0.5",
+            "chat",
+        ])
+        .expect("runtime tuning CLI");
+        let config = AppConfig::from_cli(&cli).expect("app config");
+        assert_eq!(config.runtime_tuning.flash_attn, ToggleMode::On);
+        assert_eq!(config.runtime_tuning.op_offload, ToggleMode::Off);
+        assert_eq!(config.runtime_tuning.threads, Some(12));
+        assert_eq!(config.runtime_tuning.threads_batch, Some(16));
+        assert_eq!(config.runtime_tuning.batch_size, Some(8192));
+        assert_eq!(config.runtime_tuning.ubatch_size, Some(2048));
+        assert_eq!(config.runtime_tuning.gpu_layers, Some(1));
+        assert!(config.runtime_tuning.cpu_moe);
+        assert!(config.runtime_tuning.no_host);
+        assert!(config.strata_mtp);
+        assert_eq!(config.strata_spec, Some(3));
+        assert_eq!(config.strata_spec_min_p, Some(0.5));
+    }
+
+    #[test]
+    fn runtime_tuning_rejects_zero_thread_count() {
+        let cli = Cli::try_parse_from(["winstrint", "--threads", "0", "chat"])
+            .expect("runtime tuning CLI");
+        let error = AppConfig::from_cli(&cli).expect_err("zero threads must fail");
+        assert!(
+            error
+                .to_string()
+                .contains("--threads must be greater than zero")
+        );
+    }
 }
